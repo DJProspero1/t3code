@@ -489,15 +489,19 @@ export const makeGitManager = Effect.gen(function* () {
       const shouldProbeRemoteOwnedSelectors = isCrossRepository || (remoteName !== null && remoteName !== "origin");
 
       const headSelectors: string[] = [];
+      if (isCrossRepository && shouldProbeRemoteOwnedSelectors) {
+        appendUnique(headSelectors, ownerHeadSelector);
+        appendUnique(headSelectors, remoteAliasHeadSelector !== ownerHeadSelector ? remoteAliasHeadSelector : null);
+      }
       appendUnique(headSelectors, details.branch);
       appendUnique(headSelectors, headBranch !== details.branch ? headBranch : null);
-      appendUnique(headSelectors, shouldProbeRemoteOwnedSelectors ? ownerHeadSelector : null);
-      appendUnique(
-        headSelectors,
-        shouldProbeRemoteOwnedSelectors && remoteAliasHeadSelector !== ownerHeadSelector
-          ? remoteAliasHeadSelector
-          : null,
-      );
+      if (!isCrossRepository && shouldProbeRemoteOwnedSelectors) {
+        appendUnique(headSelectors, ownerHeadSelector);
+        appendUnique(
+          headSelectors,
+          remoteAliasHeadSelector !== ownerHeadSelector ? remoteAliasHeadSelector : null,
+        );
+      }
 
       return {
         localBranch: details.branch,
