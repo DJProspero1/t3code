@@ -1624,7 +1624,9 @@ export const makeGitCore = (options?: { executeOverride?: GitCoreShape["execute"
 
         // Symlink git-ignored .env* files from the source repo into the worktree
         // so that environment configuration is available in worktree sessions.
-        yield* symlinkEnvFiles(input.cwd, worktreePath);
+        // Wrapped in Effect.ignore so a discovery failure (e.g. git timeout)
+        // does not break the already-succeeded worktree creation.
+        yield* symlinkEnvFiles(input.cwd, worktreePath).pipe(Effect.ignore);
 
         return {
           worktree: {
