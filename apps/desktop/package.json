@@ -27,5 +27,10 @@
     "vitest": "catalog:",
     "wait-on": "^8.0.2"
   },
-  "productName": "T3 Code (Alpha)"
+  "productName": "T3 Code (Alpha)",
+  "homepage": "https://github.com/pingdotgg/t3code",
+  "author": {
+    "name": "T3 Tools",
+    "email": "t3code@t3.tools"
+  }
 }

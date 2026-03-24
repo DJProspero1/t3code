@@ -171,7 +171,8 @@ interface StagePackageJson {
   readonly t3codeCommitHash: string;
   readonly private: true;
   readonly description: string;
-  readonly author: string;
+  readonly homepage: string;
+  readonly author: { name: string; email: string };
   readonly main: string;
   readonly build: Record<string, unknown>;
   readonly dependencies: Record<string, unknown>;
@@ -474,6 +475,7 @@ const createBuildConfig = Effect.fn("createBuildConfig")(function* (
       target: [target],
       icon: "icon.png",
       category: "Development",
+      maintainer: "T3 Tools <t3code@t3.tools>",
     };
   }
 
@@ -624,7 +626,8 @@ const buildDesktopArtifact = Effect.fn("buildDesktopArtifact")(function* (
     t3codeCommitHash: commitHash,
     private: true,
     description: "T3 Code desktop build",
-    author: "T3 Tools",
+    homepage: "https://github.com/pingdotgg/t3code",
+    author: { name: "T3 Tools", email: "t3code@t3.tools" },
     main: "apps/desktop/dist-electron/main.js",
     build: yield* createBuildConfig(
       options.platform,
