@@ -434,6 +434,11 @@ export interface ProviderAdapterV2OpenSessionInput {
   readonly initialProviderItemIdentityVersion?: 2;
 }
 
+/** Connect to an existing native thread; implementations must never spawn a replacement harness. */
+export interface ProviderAdapterV2AttachSessionInput extends ProviderAdapterV2OpenSessionInput {
+  readonly nativeThreadId: string;
+}
+
 export interface ProviderAdapterV2EnsureThreadInput {
   readonly threadId: ThreadId;
   readonly title?: string;
@@ -572,6 +577,10 @@ export type ProviderAdapterV2SubagentOutcome = {
 };
 
 export interface ProviderAdapterV2SessionRuntime {
+  /** Closing this runtime disconnects a client; the provider process belongs to another harness. */
+  readonly processOwnership?: "external";
+  /** The native provider retains requests and accepts their saved responses after reconnect. */
+  readonly requestsSurviveDisconnect?: true;
   readonly instanceId: ProviderInstanceId;
   readonly driver: ProviderDriverKind;
   readonly providerSessionId: ProviderSessionId;
@@ -676,5 +685,12 @@ export class ProviderAdapterV2 extends Context.Service<
     readonly openSession: (
       input: ProviderAdapterV2OpenSessionInput,
     ) => Effect.Effect<ProviderAdapterV2SessionRuntime, ProviderAdapterV2Error, Scope.Scope>;
+    readonly attachSession?: (
+      input: ProviderAdapterV2AttachSessionInput,
+    ) => Effect.Effect<
+      ProviderAdapterV2SessionRuntime & { readonly processOwnership: "external" },
+      ProviderAdapterV2Error,
+      Scope.Scope
+    >;
   }
 >()("@t3tools/provider-core/server/ProviderAdapter/ProviderAdapterV2") {}

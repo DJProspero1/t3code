@@ -5,6 +5,7 @@ let sessionId;
 let epoch;
 let sequence = 0;
 let acknowledged = 0;
+let sealedThrough = 0;
 let events = [];
 let queuedBytes = 0;
 let sending = false;
@@ -17,11 +18,37 @@ const commands = new Map();
 const steps = new Map();
 const pendingPrompts = [];
 
+function jsonBytes(value) {
+  let bytes = 0;
+  for (const char of JSON.stringify(value)) {
+    const code = char.codePointAt(0);
+    bytes += code < 0x80 ? 1 : code < 0x800 ? 2 : code < 0x10000 ? 3 : 4;
+  }
+  return bytes;
+}
+
 function record(type, payload) {
   if (!connection) return;
   try {
+    const previous = events[events.length - 1];
+    const field = payload?.chunk?.kind === 'input' ? 'json' : 'text';
+    if (type === 'step.chunk' && previous?.type === type && previous.sequence > sealedThrough &&
+      previous.payload.turnId === payload.turnId && previous.payload.agentId === payload.agentId &&
+      previous.payload.index === payload.index && previous.payload.chunk?.kind === payload.chunk?.kind &&
+      previous.payload.chunk?.index === payload.chunk?.index &&
+      typeof previous.payload.chunk?.[field] === 'string' && typeof payload.chunk?.[field] === 'string' &&
+      previous.payload.chunk[field].length + payload.chunk[field].length <= 4096) {
+      const merged = { ...previous, payload: { ...payload, chunk: { ...payload.chunk,
+        [field]: previous.payload.chunk[field] + payload.chunk[field] } } };
+      const bytes = queuedBytes - jsonBytes(previous) + jsonBytes(merged);
+      if (bytes <= 1024 * 1024) {
+        events[events.length - 1] = merged;
+        queuedBytes = bytes;
+        return;
+      }
+    }
     const event = { sequence: sequence + 1, at: new Date().toISOString(), type, payload };
-    const size = JSON.stringify(event).length;
+    const size = jsonBytes(event);
     sequence = event.sequence;
     if (queuedBytes + size > 1024 * 1024) {
       events = [{ sequence: ++sequence, at: event.at, type: 'resync', payload: {} }];
@@ -138,6 +165,8 @@ async function flush($) {
   if (!connection || sending || (events.length === 0 && Date.now() - lastContact < 500)) return;
   sending = true;
   const batch = events.slice(0, 256);
+  // Even a failed HTTP response may have committed. Never mutate a transmitted frame.
+  sealedThrough = Math.max(sealedThrough, batch[batch.length - 1]?.sequence ?? acknowledged);
   try {
     const response = await $.http.fetch(connection.url, {
       method: 'POST',
@@ -150,7 +179,7 @@ async function flush($) {
     if (!Number.isSafeInteger(reply.acknowledged) || reply.acknowledged < acknowledged || reply.acknowledged > last) return;
     acknowledged = reply.acknowledged;
     events = events.filter(event => event.sequence > acknowledged);
-    queuedBytes = events.reduce((sum, event) => sum + JSON.stringify(event).length, 0);
+    queuedBytes = events.reduce((sum, event) => sum + jsonBytes(event), 0);
     lastContact = Date.now();
     if (Array.isArray(reply.commands)) {
       for (const command of reply.commands) {
@@ -184,6 +213,7 @@ export function register(on) {
     epoch = crypto.randomUUID();
     sequence = 0;
     acknowledged = 0;
+    sealedThrough = 0;
     events = [];
     queuedBytes = 0;
     await snapshot($);

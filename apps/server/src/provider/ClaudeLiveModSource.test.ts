@@ -419,3 +419,29 @@ it("publishes a prompt identity before Claude exposes its transcript row", async
     },
   );
 });
+
+it("coalesces unsent text but never changes a frame whose acknowledgement was lost", async () => {
+  const h = harness();
+  await h.call("session.start", {});
+  const next = () =>
+    Object.assign(
+      (async function* () {
+        yield { kind: "text", index: 0, text: "A" };
+        yield { kind: "text", index: 0, text: "B" };
+        yield { kind: "text", index: 0, text: "C" };
+      })(),
+      { result: Promise.resolve({ answer: "ABC" }) },
+    );
+  const stream = h.call("turn.step", { turnId: "turn", index: 0 }, next) as AsyncGenerator<Data>;
+  await stream.next();
+  h.fail(true);
+  await h.flush();
+  await stream.next();
+  await stream.next();
+  h.fail(false);
+  await h.flush();
+  const frames = h.batches.at(-1)!.events.filter((event) => event.type === "step.chunk");
+  expect(frames.map((frame) => (frame.payload.chunk as Data).text)).toEqual(["A", "BC"]);
+  expect(frames[1]!.sequence).toBe(frames[0]!.sequence + 1);
+  await stream.next();
+});

@@ -160,6 +160,8 @@ export interface ProviderSessionManagerV2Shape {
     readonly runtimePolicy: ProviderAdapter.ProviderAdapterV2RuntimePolicy;
     readonly resumeFromSession?: OrchestrationV2ProviderSession;
     readonly initialNativeThreadId?: string;
+    /** Requires a live attachment adapter; never falls back to open/resume. */
+    readonly attachToNativeThread?: string;
     readonly initialProviderItemIdentityVersion?: 2;
   }) => Effect.Effect<
     ProviderAdapter.ProviderAdapterV2SessionRuntime,
@@ -640,6 +642,7 @@ export const layerWithOptions = (
         readonly reason: ProviderSessionReleaseReason;
         readonly releasedAt: DateTime.Utc;
       }) {
+        if (input.entry.runtime.requestsSurviveDisconnect === true) return;
         const providerSessionId = input.entry.runtime.providerSessionId;
         const now = yield* DateTime.now;
         const status = releasedRuntimeRequestStatusFor(input.reason);
@@ -753,6 +756,7 @@ export const layerWithOptions = (
         }) {
           if (
             input.reason === "server_shutdown" ||
+            input.entry.runtime.processOwnership === "external" ||
             input.entry.runtime.backgroundTasksEndWithProcess !== true
           ) {
             return [];
@@ -1090,7 +1094,7 @@ export const layerWithOptions = (
                               (other.attachedThreadIds.has(threadId) ||
                                 other.mcpCredentialIdByThread.get(threadId) === mcpCredentialId),
                           );
-                        return heldElsewhere
+                        return heldElsewhere || entry.runtime.processOwnership === "external"
                           ? Effect.void
                           : clearMcpSession(threadId, mcpCredentialId);
                       },
@@ -1121,6 +1125,7 @@ export const layerWithOptions = (
           const entry = current.get(key);
           if (
             entry === undefined ||
+            (entry.runtime.processOwnership === "external" && entry.attachedThreadIds.size > 0) ||
             entry.busyTurns.size > 0 ||
             entry.idleGeneration !== input.generation
           ) {
@@ -1577,6 +1582,7 @@ export const layerWithOptions = (
               const unloadThread = entry?.exposedRuntime.unloadThread;
               if (
                 entry === undefined ||
+                entry.runtime.processOwnership === "external" ||
                 pending === undefined ||
                 pending.generation !== input.generation ||
                 unloadThread === undefined ||
@@ -2137,6 +2143,16 @@ export const layerWithOptions = (
               const key = sessionKey(input.providerSessionId);
               const existing = (yield* Ref.get(sessions)).get(key);
               if (existing !== undefined) {
+                if (
+                  input.attachToNativeThread !== undefined &&
+                  existing.runtime.processOwnership !== "external"
+                )
+                  return yield* new ProviderSessionOpenError({
+                    instanceId: input.modelSelection.instanceId,
+                    providerSessionId: input.providerSessionId,
+                    cause:
+                      "The existing T3 runtime does not own the requested external attachment.",
+                  });
                 const attached = existing.attachedThreadIds.has(input.threadId);
                 if (!attached && !existing.supportsMultipleProviderThreads) {
                   return yield* new ProviderSessionOpenError({
@@ -2165,6 +2181,24 @@ export const layerWithOptions = (
                     }),
                 ),
               );
+              const nativeAttachment = input.attachToNativeThread;
+              if (
+                nativeAttachment !== undefined &&
+                (!nativeAttachment.trim() ||
+                  adapter.attachSession === undefined ||
+                  (input.initialNativeThreadId !== undefined &&
+                    input.initialNativeThreadId !== nativeAttachment))
+              )
+                return yield* new ProviderSessionOpenError({
+                  instanceId: input.modelSelection.instanceId,
+                  providerSessionId: input.providerSessionId,
+                  cause:
+                    "This provider cannot attach to the requested live thread without replacing its process.",
+                });
+              const openRuntime = (options: ProviderAdapter.ProviderAdapterV2OpenSessionInput) =>
+                nativeAttachment === undefined
+                  ? adapter.openSession(options)
+                  : adapter.attachSession!({ ...options, nativeThreadId: nativeAttachment });
               const prepared = yield* prepareMcpSession(
                 input.threadId,
                 input.modelSelection.instanceId,
@@ -2179,56 +2213,53 @@ export const layerWithOptions = (
               });
               const sessionScope = yield* Scope.fork(sessionScopes);
               yield* agentScope.clear(input.threadId);
-              const runtime = yield* adapter
-                .openSession({
-                  threadId: input.threadId,
-                  providerSessionId: input.providerSessionId,
-                  modelSelection: input.modelSelection,
-                  runtimePolicy: input.runtimePolicy,
-                  ...(input.resumeFromSession === undefined
-                    ? {}
-                    : { resumeFromSession: input.resumeFromSession }),
-                  ...(input.initialNativeThreadId === undefined
-                    ? {}
-                    : { initialNativeThreadId: input.initialNativeThreadId }),
-                  ...(input.initialProviderItemIdentityVersion === undefined
-                    ? {}
-                    : {
-                        initialProviderItemIdentityVersion:
-                          input.initialProviderItemIdentityVersion,
+              const runtime = yield* openRuntime({
+                threadId: input.threadId,
+                providerSessionId: input.providerSessionId,
+                modelSelection: input.modelSelection,
+                runtimePolicy: input.runtimePolicy,
+                ...(input.resumeFromSession === undefined
+                  ? {}
+                  : { resumeFromSession: input.resumeFromSession }),
+                ...(input.initialNativeThreadId === undefined
+                  ? {}
+                  : { initialNativeThreadId: input.initialNativeThreadId }),
+                ...(input.initialProviderItemIdentityVersion === undefined
+                  ? {}
+                  : {
+                      initialProviderItemIdentityVersion: input.initialProviderItemIdentityVersion,
+                    }),
+              }).pipe(
+                Effect.provideService(Scope.Scope, sessionScope),
+                // Bound scope close after cleanup; a wedged finalizer must not hold the open lock or interrupter.
+                Effect.onError(() =>
+                  dropReservation.pipe(
+                    Effect.andThen(
+                      prepared.issued
+                        ? clearMcpSession(input.threadId, mcpCredentialId)
+                        : Effect.void,
+                    ),
+                    Effect.ensuring(
+                      closeScopeWithin(sessionScope, {
+                        providerSessionId: input.providerSessionId,
+                        reason: "open_failed",
                       }),
-                })
-                .pipe(
-                  Effect.provideService(Scope.Scope, sessionScope),
-                  // Bound scope close after cleanup; a wedged finalizer must not hold the open lock or interrupter.
-                  Effect.onError(() =>
-                    dropReservation.pipe(
-                      Effect.andThen(
-                        prepared.issued
-                          ? clearMcpSession(input.threadId, mcpCredentialId)
-                          : Effect.void,
-                      ),
-                      Effect.ensuring(
-                        closeScopeWithin(sessionScope, {
-                          providerSessionId: input.providerSessionId,
-                          reason: "open_failed",
-                        }),
-                      ),
                     ),
                   ),
-                  Effect.mapError(
-                    (cause) =>
-                      new ProviderSessionOpenError({
-                        instanceId: input.modelSelection.instanceId,
-                        providerSessionId: input.providerSessionId,
-                        cause,
-                      }),
-                  ),
-                  withMetrics({
-                    counter: providerSessionsTotal,
-                    attributes: { provider: adapter.driver, operation: "open" },
-                  }),
-                );
+                ),
+                Effect.mapError(
+                  (cause) =>
+                    new ProviderSessionOpenError({
+                      instanceId: input.modelSelection.instanceId,
+                      providerSessionId: input.providerSessionId,
+                      cause,
+                    }),
+                ),
+                withMetrics({
+                  counter: providerSessionsTotal,
+                  attributes: { provider: adapter.driver, operation: "open" },
+                }),
+              );
               const eventSubscribers = yield* Ref.make<
                 ReadonlyMap<number, Queue.Queue<ProviderSessionEventSignal, Cause.Done>>
               >(new Map());
@@ -2412,9 +2443,13 @@ export const layerWithOptions = (
                     .map((thread) => [thread.id, thread] as const),
                 );
                 detachedProviderThreads = [...providerThreads.values()];
-                const activeTurns = projection.value.providerTurns.filter(
-                  (turn) => turn.status === "running" && providerThreads.has(turn.providerThreadId),
-                );
+                const activeTurns =
+                  currentEntry.runtime.processOwnership === "external"
+                    ? []
+                    : projection.value.providerTurns.filter(
+                        (turn) =>
+                          turn.status === "running" && providerThreads.has(turn.providerThreadId),
+                      );
                 yield* Effect.forEach(
                   activeTurns,
                   (turn) =>
@@ -2508,7 +2543,11 @@ export const layerWithOptions = (
               return;
             }
             const unloadThread = detached.value.exposedRuntime.unloadThread;
-            if (detached.value.supportsMultipleProviderThreads && unloadThread !== undefined) {
+            if (
+              detached.value.runtime.processOwnership !== "external" &&
+              detached.value.supportsMultipleProviderThreads &&
+              unloadThread !== undefined
+            ) {
               // Serialize unload with attachment so attached threads stay loaded and later attaches resume after unload.
               yield* threadAttachment.withLock(
                 threadAttachmentKey(input),
