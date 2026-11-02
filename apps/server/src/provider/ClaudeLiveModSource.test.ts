@@ -22,6 +22,8 @@ function harness(url = "http://127.0.0.1:12345/live", interactive = false) {
   let invalidAck = false;
   let agentStatus = "running";
   let failSnapshot = false;
+  let configured = true;
+  let time = 1_000_000;
   const engine = {
     plugin: { root: "/plugin" },
     session: {
@@ -47,14 +49,18 @@ function harness(url = "http://127.0.0.1:12345/live", interactive = false) {
       },
       exists: async () => true,
       read: async () =>
-        JSON.stringify({
-          session: {
-            url,
-            token: "a".repeat(32),
-            aliasesDirectory: "/plugin/aliases",
-            ...(interactive ? { waitCommand: ["fake-t3", "thread", "_bridge-request"] } : {}),
-          },
-        }),
+        JSON.stringify(
+          configured
+            ? {
+                session: {
+                  url,
+                  token: "a".repeat(32),
+                  aliasesDirectory: "/plugin/aliases",
+                  ...(interactive ? { waitCommand: ["fake-t3", "thread", "_bridge-request"] } : {}),
+                },
+              }
+            : {},
+        ),
     },
     process: {
       run: async (_argv: string[], init: { stdin: string }) => {
@@ -91,7 +97,15 @@ function harness(url = "http://127.0.0.1:12345/live", interactive = false) {
   };
   const register = NodeVM.runInNewContext(
     claudeLiveModSource.replace("export function register", "function register") + "\nregister;",
-    { URL, crypto: { randomUUID: NodeCrypto.randomUUID } },
+    {
+      URL,
+      crypto: { randomUUID: NodeCrypto.randomUUID },
+      Date: class extends Date {
+        static override now() {
+          return time;
+        }
+      },
+    },
   ) as (on: (name: string, handler: Handler) => { catch: (fallback: Handler) => void }) => void;
   register((name, handler) => {
     handlers.set(name, handler);
@@ -114,6 +128,12 @@ function harness(url = "http://127.0.0.1:12345/live", interactive = false) {
   };
   return {
     call,
+    configure: (value: boolean) => {
+      configured = value;
+    },
+    advance: (ms: number) => {
+      time += ms;
+    },
     batches,
     calls,
     requests,
@@ -444,4 +464,30 @@ it("coalesces unsent text but never changes a frame whose acknowledgement was lo
   expect(frames.map((frame) => (frame.payload.chunk as Data).text)).toEqual(["A", "BC"]);
   expect(frames[1]!.sequence).toBe(frames[0]!.sequence + 1);
   await stream.next();
+});
+
+it("activates a preloaded connection without reload and retains its replay epoch on reattachment", async () => {
+  const h = harness();
+  h.configure(false);
+  await h.call("session.start", {});
+  await h.flush();
+  expect(h.batches).toHaveLength(0);
+  h.configure(true);
+  h.advance(2001);
+  await h.flush();
+  expect(h.batches[0]?.events[0]?.type).toBe("snapshot");
+  const epoch = h.batches[0]?.epoch;
+  h.configure(false);
+  h.advance(2001);
+  await h.flush();
+  const before = h.batches.length;
+  await h.call("turn.start", { turnId: "detached" });
+  await h.flush();
+  expect(h.batches).toHaveLength(before);
+  h.configure(true);
+  h.advance(2001);
+  await h.flush();
+  expect(h.batches.at(-1)?.epoch).toBe(epoch);
+  expect(h.batches.at(-1)?.events.some((event) => event.type === "snapshot")).toBe(true);
+  await h.call("session.end", {});
 });

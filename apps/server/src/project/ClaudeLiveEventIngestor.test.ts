@@ -287,3 +287,48 @@ it.effect(
       expect(rows.turnItems).toHaveLength(0);
     }).pipe(Effect.provide(layer)),
 );
+
+it.effect("closes withdrawn native requests and replays the cancellation after reconnect", () =>
+  Effect.gen(function* () {
+    const sink = yield* EventSink.EventSinkV2;
+    const projections = yield* ProjectionStore.ProjectionStoreV2;
+    const ingest = yield* Ingestor.ClaudeLiveEventIngestor;
+    yield* sink.write({
+      events: [attachmentEvent(thread.id, "thread.created", thread, thread.createdAt, "create")],
+    });
+    const input = {
+      thread,
+      providerSessionId: ProviderSessionId.make("live-session"),
+      request: {
+        sessionId: "session",
+        epoch: "source-process",
+        requestId: "withdrawn",
+        kind: "permission" as const,
+        payload: { tool_name: "Bash", tool_input: { command: "printf fixture" } },
+      },
+    };
+    expect(yield* ingest.request(input)).toEqual({ type: "pending" });
+    const update = {
+      root: thread,
+      batch: {
+        ...batch,
+        events: [
+          { sequence: 1, type: "request.closed" as const, payload: { requestId: "withdrawn" } },
+        ],
+      },
+      resolveChild: () => Effect.succeed(thread),
+    };
+    yield* ingest.ingest(update);
+    yield* ingest.ingest(update);
+    const rows = yield* projections.getThreadRecords(thread.id, [
+      "runtimeRequests",
+      "turnItems",
+      "nodes",
+    ]);
+    expect(rows.runtimeRequests).toHaveLength(1);
+    expect(rows.runtimeRequests[0]?.status).toBe("cancelled");
+    expect(rows.turnItems[0]?.status).toBe("cancelled");
+    expect(rows.nodes[0]?.status).toBe("cancelled");
+    expect(yield* ingest.request(input)).toEqual({ type: "cancelled" });
+  }).pipe(Effect.provide(layer)),
+);

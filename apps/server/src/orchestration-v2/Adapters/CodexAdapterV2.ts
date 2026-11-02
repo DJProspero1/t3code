@@ -1,3 +1,6 @@
+import * as NodeNet from "node:net";
+import * as NodeSocket from "@effect/platform-node/NodeSocket";
+import * as Socket from "effect/socket/Socket";
 import { pipe } from "effect/Function";
 import * as DocumentText from "../../provider/DocumentText.ts";
 import { revertCodexThread } from "../../provider/CodexThreadRevert.ts";
@@ -1314,6 +1317,8 @@ export interface CodexAppServerClientFactoryShape {
     readonly runtimePolicy: ProviderAdapter.ProviderAdapterV2RuntimePolicy;
     readonly settings: CodexSettings;
     readonly environment: NodeJS.ProcessEnv;
+    /** Connect to a running daemon; never spawn or take ownership of it. */
+    readonly daemonSocketPath?: string;
   }) => Effect.Effect<
     CodexClient.CodexAppServerClient["Service"],
     ProviderAdapter.ProviderAdapterOpenSessionError,
@@ -1531,6 +1536,61 @@ export const layerAppServerClientFactory: Layer.Layer<
           ...codexAppServerEnvironment(input.environment),
           ...(input.settings.homePath ? { CODEX_HOME: input.settings.homePath } : {}),
         };
+        const protocolLogger = makeCodexAppServerProtocolLogger({
+          nativeEventLogger,
+          threadId: input.threadId,
+          providerSessionId: input.providerSessionId,
+        });
+        const clientOptions: CodexClient.CodexAppServerClientOptions =
+          protocolLogger === undefined
+            ? {}
+            : {
+                logIncoming: true,
+                logOutgoing: true,
+                logger: protocolLogger,
+              };
+        if (input.daemonSocketPath !== undefined) {
+          // The daemon control socket speaks WebSocket, not the JSONL used by a
+          // newly spawned app-server. Explicitly use ws for its Unix-socket support.
+          if (!input.daemonSocketPath.startsWith("/") || /[\r\n\0]/.test(input.daemonSocketPath))
+            return yield* new ProviderAdapter.ProviderAdapterOpenSessionError({
+              driver: CODEX_PROVIDER,
+              providerSessionId: input.providerSessionId,
+              cause: "Invalid local Codex daemon socket path",
+            });
+          const socketPath = input.daemonSocketPath;
+          const socketLayer = Layer.effect(
+            Socket.Socket,
+            Socket.makeWebSocket("ws://localhost/", { openTimeout: "5 seconds" }),
+          ).pipe(
+            Layer.provide(
+              Layer.succeed(
+                Socket.WebSocketConstructor,
+                (url) =>
+                  new NodeSocket.NodeWS.WebSocket(url, {
+                    // The path is a filesystem path, not URL syntax. Spaces and colons
+                    // must reach net.connect unchanged; no TCP connection is attempted.
+                    createConnection: () => NodeNet.createConnection({ path: socketPath }),
+                  }),
+              ),
+            ),
+          );
+          const context = yield* Layer.build(
+            CodexClient.layerWebSocket(clientOptions).pipe(Layer.provide(socketLayer)),
+          ).pipe(
+            Effect.mapError(
+              (cause) =>
+                new ProviderAdapter.ProviderAdapterOpenSessionError({
+                  driver: CODEX_PROVIDER,
+                  providerSessionId: input.providerSessionId,
+                  cause,
+                }),
+            ),
+          );
+          return yield* Effect.service(CodexClient.CodexAppServerClient).pipe(
+            Effect.provide(context),
+          );
+        }
         const command = yield* makeCodexAppServerSpawnCommand({
           command: input.settings.binaryPath || "codex",
           args: codexAppServerArgs(
@@ -1550,19 +1610,6 @@ export const layerAppServerClientFactory: Layer.Layer<
               }),
           ),
         );
-        const protocolLogger = makeCodexAppServerProtocolLogger({
-          nativeEventLogger,
-          threadId: input.threadId,
-          providerSessionId: input.providerSessionId,
-        });
-        const clientOptions: CodexClient.CodexAppServerClientOptions =
-          protocolLogger === undefined
-            ? {}
-            : {
-                logIncoming: true,
-                logOutgoing: true,
-                logger: protocolLogger,
-              };
         const context = yield* Layer.build(CodexClient.layerChildProcess(handle, clientOptions));
         return yield* Effect.service(CodexClient.CodexAppServerClient).pipe(
           Effect.provide(context),

@@ -26,7 +26,10 @@ import type {
 import { attachmentNodeId } from "./claudeAttachmentProjection.ts";
 import { claudeLiveMessageEventId } from "./claudeLiveProjection.ts";
 
-export const liveRequestId = (thread: OrchestrationV2AppThread, input: ClaudeLiveRequestPayload) =>
+export const liveRequestId = (
+  thread: OrchestrationV2AppThread,
+  input: Pick<ClaudeLiveRequestPayload, "epoch" | "requestId">,
+) =>
   RuntimeRequestId.make(
     claudeLiveMessageEventId(thread.id, JSON.stringify([input.epoch, input.requestId])),
   );

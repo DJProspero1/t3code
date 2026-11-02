@@ -10,6 +10,9 @@ let events = [];
 let queuedBytes = 0;
 let sending = false;
 let timer;
+let timerInterval;
+let lastConfigRead = 0;
+let readingConfig = false;
 let lastContact = 0;
 let lastSnapshot = 0;
 let snapshotFingerprint;
@@ -198,30 +201,59 @@ async function flush($) {
   }
 }
 
+function armTimer($, interval) {
+  if (timer && timerInterval === interval) return;
+  if (timer) timer.cancel();
+  timerInterval = interval;
+  timer = $.clock.every(interval, async () => {
+    if (Date.now() - lastConfigRead >= 2000) await refreshConnection($);
+    if (connection && Date.now() - lastSnapshot >= 2000) void snapshot($);
+    await flush($);
+  });
+}
+
+async function refreshConnection($) {
+  if (readingConfig) return;
+  readingConfig = true;
+  lastConfigRead = Date.now();
+  try {
+    const path = $.plugin.root + '/connections.json';
+    if (!(await $.fs.exists(path))) return;
+    const configured = JSON.parse(await $.fs.read(path))[sessionId];
+    if (!configured) {
+      connection = undefined;
+      armTimer($, 2000);
+      return;
+    }
+    const url = new URL(configured.url);
+    if (url.protocol !== 'http:' || url.hostname !== '127.0.0.1' || url.username || url.password) return;
+    if (typeof configured.token !== 'string' || configured.token.length < 32) return;
+    const waitCommand = Array.isArray(configured.waitCommand) && configured.waitCommand.length > 0 && configured.waitCommand.every(arg => typeof arg === 'string') ? configured.waitCommand : undefined;
+    const wasConnected = connection !== undefined;
+    connection = { url: url.href, token: configured.token, waitCommand, aliasesDirectory: configured.aliasesDirectory };
+    armTimer($, 50);
+    if (!wasConnected) {
+      snapshotFingerprint = undefined;
+      await snapshot($);
+    }
+  } catch {
+    // A transient read or atomic settings replacement must not cancel native work.
+  } finally {
+    readingConfig = false;
+  }
+}
+
 export function register(on) {
   on('session.start', async ($, e, next) => {
     sessionId = await $.session.id();
-    const path = $.plugin.root + '/connections.json';
-    if (!(await $.fs.exists(path))) return next(e);
-    const configured = JSON.parse(await $.fs.read(path))[sessionId];
-    if (!configured) return next(e);
-    const url = new URL(configured.url);
-    if (url.protocol !== 'http:' || url.hostname !== '127.0.0.1' || url.username || url.password) return next(e);
-    if (typeof configured.token !== 'string' || configured.token.length < 32) return next(e);
-    const waitCommand = Array.isArray(configured.waitCommand) && configured.waitCommand.length > 0 && configured.waitCommand.every(arg => typeof arg === 'string') ? configured.waitCommand : undefined;
-    connection = { url: url.href, token: configured.token, waitCommand, aliasesDirectory: configured.aliasesDirectory };
     epoch = crypto.randomUUID();
     sequence = 0;
     acknowledged = 0;
     sealedThrough = 0;
     events = [];
     queuedBytes = 0;
-    await snapshot($);
-    if (timer) timer.cancel();
-    timer = $.clock.every(50, () => {
-      if (Date.now() - lastSnapshot >= 2000) void snapshot($);
-      return flush($);
-    });
+    armTimer($, 2000);
+    await refreshConnection($);
     return next(e);
   }).catch(($, e, next) => next(e));
 

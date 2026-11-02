@@ -249,6 +249,57 @@ export const layer = Layer.effect(
               const parsedAt = frame.at === undefined ? Option.some(now) : DateTime.make(frame.at);
               if (Option.isNone(parsedAt))
                 return yield* new ClaudeLiveTransportError({ reason: "invalid-batch" });
+              if (frame.type === "request.closed") {
+                const nativeRequestId = field(frame.payload, "requestId");
+                if (typeof nativeRequestId !== "string")
+                  return yield* new ClaudeLiveTransportError({ reason: "invalid-batch" });
+                const context = yield* projections.getRuntimeResponseContext(
+                  group.thread.id,
+                  liveRequestId(group.thread, { epoch: batch.epoch, requestId: nativeRequestId }),
+                );
+                // A withdrawn native callback cannot consume an answer. Preserve a response
+                // already accepted by T3, but close unanswered cards and their execution node.
+                if (context.request?.status === "pending") {
+                  const closed: OrchestrationV2DomainEvent[] = [];
+                  const emit = (
+                    type: OrchestrationV2DomainEvent["type"],
+                    payload: OrchestrationV2DomainEvent["payload"],
+                  ) => {
+                    closed.push({
+                      id: claudeLiveFrameEventId(
+                        group.thread.id,
+                        batch.epoch,
+                        frame,
+                        closed.length,
+                      ),
+                      threadId: group.thread.id,
+                      type,
+                      payload,
+                      occurredAt: parsedAt.value,
+                    } as OrchestrationV2DomainEvent);
+                  };
+                  emit("runtime-request.updated", {
+                    ...context.request,
+                    status: "cancelled",
+                    resolvedAt: parsedAt.value,
+                  });
+                  if (context.node)
+                    emit("node.updated", {
+                      ...context.node,
+                      status: "cancelled",
+                      completedAt: parsedAt.value,
+                    });
+                  if (context.item)
+                    emit("turn-item.updated", {
+                      ...context.item,
+                      status: "cancelled",
+                      completedAt: parsedAt.value,
+                      updatedAt: parsedAt.value,
+                    });
+                  events.push(...closed);
+                }
+                continue;
+              }
               const projected = projectClaudeLiveFrame({
                 thread: group.thread,
                 parent: group.agentId === null ? null : root,
