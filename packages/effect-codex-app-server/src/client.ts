@@ -2,9 +2,13 @@ import * as Context from "effect/Context";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as PlatformError from "effect/PlatformError";
 import * as Schema from "effect/Schema";
 import * as Scope from "effect/Scope";
 import * as Stdio from "effect/Stdio";
+import * as Sink from "effect/Sink";
+import * as Stream from "effect/Stream";
+import * as Socket from "effect/socket/Socket";
 import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
 
 import * as CodexRpc from "./_generated/meta.gen.ts";
@@ -306,6 +310,58 @@ export const layerChildProcess = (
   options: CodexAppServerClientOptions = {},
 ): Layer.Layer<CodexAppServerClient> =>
   Layer.effect(CodexAppServerClient, makeChildProcessClient(handle, options));
+
+// The supplied socket must preserve WebSocket message boundaries, not TCP chunks.
+export const layerWebSocket = (
+  options: CodexAppServerClientOptions = {},
+): Layer.Layer<CodexAppServerClient, CodexError.CodexAppServerError, Socket.Socket> =>
+  Layer.effect(
+    CodexAppServerClient,
+    Effect.gen(function* () {
+      const socket = yield* Socket.Socket;
+      const reader = yield* socket.reader.pipe(
+        Effect.mapError(
+          (cause) =>
+            new CodexError.CodexAppServerTransportError({
+              operation: "read-input-stream",
+              cause,
+            }),
+        ),
+      );
+      const writer = yield* socket.writer;
+      const encoder = new TextEncoder();
+      const decoder = new TextDecoder();
+      const socketError = (method: string) => (cause: Socket.SocketError) =>
+        PlatformError.systemError({
+          _tag: "Unknown",
+          module: "WebSocket",
+          method,
+          cause,
+        });
+      return yield* make(
+        Stdio.make({
+          args: Effect.succeed([]),
+          // App-server sends one JSON value per frame without a JSONL delimiter.
+          stdin: Stream.fromPull(Effect.succeed(reader.pull)).pipe(
+            Stream.map((frame) =>
+              encoder.encode(`${typeof frame === "string" ? frame : decoder.decode(frame)}\n`),
+            ),
+            Stream.mapError(socketError("read")),
+          ),
+          stdout: () =>
+            Sink.forEach((chunk: string | Uint8Array) =>
+              writer
+                .write(
+                  (typeof chunk === "string" ? chunk : decoder.decode(chunk)).replace(/\n$/, ""),
+                )
+                .pipe(Effect.mapError(socketError("write"))),
+            ),
+          stderr: () => Sink.drain,
+        }),
+        options,
+      );
+    }),
+  );
 
 const makeChildProcessClient = Effect.fn(
   "effect-codex-app-server/CodexAppServerClient.makeChildProcessClient",

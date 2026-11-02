@@ -535,6 +535,12 @@ export const makeCodexAppServerPatchedProtocol = Effect.fn("makeCodexAppServerPa
         ...(payload !== undefined ? { params: payload } : {}),
       });
 
+    yield* Effect.addFinalizer(() =>
+      handleTermination(() =>
+        Effect.succeed(new CodexError.CodexAppServerInputStreamEndedError({})),
+      ),
+    );
+
     return {
       incomingNotifications: Stream.fromQueue(incomingNotifications),
       incomingRequests: Stream.fromQueue(incomingRequests),
