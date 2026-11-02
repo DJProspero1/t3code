@@ -312,3 +312,38 @@ it("preserves explicitly human plugin prompts while keeping ordinary plugin traf
     for (const event of events) expect(isEvent(event)).toBe(true);
   }
 });
+
+it("backfills thinking as separate completed rows without putting it in human chat", () => {
+  const events = projectAttachmentLine({
+    thread,
+    parent: null,
+    agentId: null,
+    ordinal: 1,
+    includeActivity: false,
+    line: JSON.stringify({
+      ...record,
+      message: {
+        content: [
+          { type: "thinking", thinking: "First reasoning block", signature: "native-signature" },
+          { type: "thinking", thinking: "Second reasoning block" },
+          { type: "redacted_thinking", data: "opaque-provider-data" },
+          { type: "text", text: "The answer." },
+        ],
+      },
+    }),
+  });
+  for (const event of events) expect(isEvent(event)).toBe(true);
+  const thoughts = events.flatMap((event) =>
+    event.type === "turn-item.updated" && event.payload.type === "reasoning" ? [event.payload] : [],
+  );
+  expect(thoughts).toHaveLength(2);
+  expect(thoughts[0]).toMatchObject({
+    text: "First reasoning block",
+    streaming: false,
+    status: "completed",
+  });
+  expect(thoughts[0]?.id).not.toBe(thoughts[1]?.id);
+  expect(
+    events.filter((event) => event.type === "message.updated").map((event) => event.payload.text),
+  ).toEqual(["The answer."]);
+});

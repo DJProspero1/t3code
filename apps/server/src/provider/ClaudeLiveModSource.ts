@@ -17,6 +17,7 @@ let lastContact = 0;
 let lastSnapshot = 0;
 let snapshotFingerprint;
 let snapshotting = false;
+let rootTurn;
 const commands = new Map();
 const steps = new Map();
 const pendingPrompts = [];
@@ -72,6 +73,7 @@ async function snapshot($) {
   try {
     const payload = {
       model: await $.session.model(),
+      rootTurn,
       agents: await $.agent.list(),
       version: await $.session.version(),
     };
@@ -267,6 +269,7 @@ export function register(on) {
   }).catch(($, e, next) => next(e));
 
   on('turn.start', async ($, e, next) => {
+    if (e.agentId === undefined) rootTurn = { turnId: e.turnId, state: 'running' };
     record('turn.start', e);
     return next(e);
   });
@@ -294,13 +297,15 @@ export function register(on) {
     const commandId = e.door === 'prompt' && e.origin?.kind === 'plugin' && e.origin.name === 't3-live-session' && e.origin.asUser === true
       ? pendingPrompts.shift() : undefined;
     const step = e.door === 'response' ? steps.get(e.agentId ?? '') : undefined;
+    const aliasStep = Number.isInteger(step?.blockIndex) ? step : undefined;
+    const role = e.message?.role ?? e.message?.type;
     // Publish the identity before Claude makes the JSONL row visible to its follower.
     // This also survives a lost live batch or a server restart.
-    if (connection && typeof connection.aliasesDirectory === 'string' && /^[a-zA-Z0-9_-]{1,128}$/.test(e.uuid) && (step || commandId)) {
+    if (connection && typeof connection.aliasesDirectory === 'string' && /^[a-zA-Z0-9_-]{1,128}$/.test(e.uuid) && ['user', 'assistant'].includes(role) && (aliasStep || commandId)) {
       try {
         await $.fs.write(connection.aliasesDirectory + '/' + e.uuid + '.json', JSON.stringify({
-          version: 1, epoch, uuid: e.uuid, role: e.message?.role ?? e.message?.type,
-          agentId: e.agentId ?? null, step, commandId,
+          version: 1, epoch, uuid: e.uuid, role,
+          agentId: e.agentId ?? null, step: aliasStep, commandId,
         }));
       } catch {
         // Failure to record observer metadata must not fail Claude's append.
@@ -351,6 +356,7 @@ export function register(on) {
   }).catch(() => ({ action: 'cancel' }));
 
   on('turn.complete', async ($, e, next) => {
+    if (e.agentId === undefined) rootTurn = { turnId: e.turnId, state: 'completed', reason: e.reason };
     record('turn.complete', e);
     steps.delete(e.agentId ?? '');
     if (connection) await snapshot($);

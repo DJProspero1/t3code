@@ -113,7 +113,13 @@ export function projectClaudeLiveFrame(input: {
       updatedAt: at,
     };
   };
-  const turnId = field(payload, "turnId");
+  const snapshotTurn =
+    frame.type === "snapshot" && input.parent === null ? field(payload, "rootTurn") : undefined;
+  const snapshotState = field(snapshotTurn, "state");
+  const hasSnapshotTurn =
+    typeof field(snapshotTurn, "turnId") === "string" &&
+    (snapshotState === "running" || snapshotState === "completed");
+  const turnId = hasSnapshotTurn ? field(snapshotTurn, "turnId") : field(payload, "turnId");
   const stepIndex = field(payload, "index");
   const stepId =
     typeof turnId === "string" && typeof stepIndex === "number"
@@ -239,10 +245,12 @@ export function projectClaudeLiveFrame(input: {
   } else if (
     frame.type === "turn.start" ||
     frame.type === "step.start" ||
-    frame.type === "turn.complete"
+    frame.type === "turn.complete" ||
+    hasSnapshotTurn
   ) {
-    const complete = frame.type === "turn.complete";
-    const reason = field(payload, "reason");
+    const complete =
+      frame.type === "turn.complete" || (hasSnapshotTurn && snapshotState === "completed");
+    const reason = field(hasSnapshotTurn ? snapshotTurn : payload, "reason");
     const status = !complete
       ? "running"
       : reason === "aborted"
@@ -334,6 +342,7 @@ export function projectClaudeLiveFrame(input: {
       if (typeof block !== "number") return [];
       const id = TurnItemId.make(`${stepId}:thinking:${block}`);
       const previous = input.items.get(id);
+      if (previous?.type === "reasoning" && !previous.streaming) return [];
       emit("turn-item.updated", {
         ...base(id, id),
         type: "reasoning",
@@ -418,6 +427,7 @@ export function projectClaudeLiveFrame(input: {
         ? { sentMessage: previous }
         : {}),
       previousTools: tools,
+      previousReasoning: input.items,
       line: JSON.stringify({
         type: role,
         uuid,

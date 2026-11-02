@@ -42,6 +42,7 @@ const Record = Schema.Struct({
             Schema.Struct({
               type: Schema.String,
               text: Schema.optional(Schema.String),
+              thinking: Schema.optional(Schema.String),
               id: Schema.optional(Schema.String),
               name: Schema.optional(Schema.String),
               input: Schema.optional(Schema.Unknown),
@@ -80,6 +81,11 @@ export function attachmentDetails(line: string, sessionId: string) {
               : [],
         )
       : [],
+    thinkingBlocks: Array.isArray(record.value.message?.content)
+      ? record.value.message.content.flatMap((block, index) =>
+          block.type === "thinking" && typeof block.thinking === "string" ? [index] : [],
+        )
+      : [],
     isPeer: record.value.origin?.kind === "peer",
     model: record.value.message?.model,
     spawn: Option.getOrNull(spawn),
@@ -109,6 +115,20 @@ export function attachmentEvent<T extends OrchestrationV2DomainEvent["type"]>(
   } as OrchestrationV2DomainEvent;
 }
 
+export function attachmentReasoningId(
+  threadId: ThreadId,
+  uuid: string,
+  blockIndex: number,
+  messageId?: MessageId,
+) {
+  const live = messageId?.match(/^(.*):text:(\d+)$/);
+  return TurnItemId.make(
+    live
+      ? `${live[1]}:thinking:${Number(live[2]) + blockIndex}`
+      : `${threadId}:${uuid}:thinking:${blockIndex}`,
+  );
+}
+
 export function projectAttachmentLine(input: {
   thread: OrchestrationV2AppThread;
   parent: OrchestrationV2AppThread | null;
@@ -122,6 +142,7 @@ export function projectAttachmentLine(input: {
   sentMessage?: OrchestrationV2ConversationMessage | undefined;
   previousSubagent?: OrchestrationV2Subagent | undefined;
   previousTools?: ReadonlyMap<string, OrchestrationV2TurnItem>;
+  previousReasoning?: ReadonlyMap<TurnItemId, OrchestrationV2TurnItem>;
 }): ReadonlyArray<OrchestrationV2DomainEvent> {
   const decoded = decodeRecord(input.line);
   if (Option.isNone(decoded)) return [];
@@ -237,7 +258,48 @@ export function projectAttachmentLine(input: {
     );
   }
   if (Array.isArray(content)) {
-    for (const block of content) {
+    for (const [blockIndex, block] of content.entries()) {
+      if (
+        record.type === "assistant" &&
+        block.type === "thinking" &&
+        typeof block.thinking === "string"
+      ) {
+        const id = attachmentReasoningId(thread.id, record.uuid, blockIndex, input.messageId);
+        const previous = input.previousReasoning?.get(id);
+        const item: OrchestrationV2TurnItem = {
+          id,
+          threadId: thread.id,
+          runId: null,
+          nodeId: null,
+          providerThreadId: thread.activeProviderThreadId,
+          providerTurnId: null,
+          nativeItemRef: {
+            driver: ProviderDriverKind.make("claudeAgent"),
+            nativeId: record.uuid,
+            strength: "strong",
+          },
+          parentItemId: null,
+          ordinal: previous?.ordinal ?? input.ordinal,
+          type: "reasoning",
+          title: "Thinking",
+          text: block.thinking,
+          streaming: false,
+          status: "completed",
+          startedAt: previous?.startedAt ?? at,
+          completedAt: at,
+          updatedAt: at,
+        };
+        events.push(
+          attachmentEvent(
+            thread.id,
+            "turn-item.updated",
+            item,
+            at,
+            `thinking-v1:${key}:${blockIndex}`,
+          ),
+        );
+        continue;
+      }
       const id =
         block.type === "tool_use"
           ? block.id

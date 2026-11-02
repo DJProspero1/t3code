@@ -189,3 +189,46 @@ it("does not append delayed stream chunks to a block already completed by transc
   expect([...p.messages.values()]).toMatchObject([{ text: "Complete answer", streaming: false }]);
   expect(p.messages.size).toBe(1);
 });
+
+it("restores a known root turn from the reconnect snapshot without guessing that unknown work finished", () => {
+  const p = projection();
+  expect(p.accept("snapshot", { agents: [] })).toHaveLength(0);
+  expect(
+    p.accept("snapshot", { rootTurn: { turnId: "native-running", state: "running" } })[0]?.payload,
+  ).toMatchObject({
+    status: "running",
+    nativeItemRef: { nativeId: "native-running" },
+    completedAt: null,
+  });
+  expect(
+    p.accept("snapshot", {
+      rootTurn: { turnId: "native-running", state: "completed", reason: "aborted" },
+    })[0]?.payload,
+  ).toMatchObject({ status: "interrupted" });
+});
+
+it("replaces partial thinking with its complete native block and ignores delayed deltas", () => {
+  const p = projection();
+  const step = { turnId: "turn", index: 0, blockIndex: 0 };
+  p.accept("step.chunk", { ...step, chunk: { kind: "thinking", index: 0, text: "Partial" } });
+  const first = [...p.items.values()][0]!;
+  p.accept("message", {
+    uuid: "native-thinking",
+    step,
+    message: {
+      type: "assistant",
+      role: "assistant",
+      content: [{ type: "thinking", thinking: "Complete native thinking" }],
+    },
+  });
+  expect(p.items.size).toBe(1);
+  expect(p.items.get(first.id)).toMatchObject({
+    text: "Complete native thinking",
+    streaming: false,
+    ordinal: first.ordinal,
+  });
+  expect(
+    p.accept("step.chunk", { ...step, chunk: { kind: "thinking", index: 0, text: " delayed" } }),
+  ).toHaveLength(0);
+  expect(p.messages.size).toBe(0);
+});

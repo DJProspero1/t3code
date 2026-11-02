@@ -260,7 +260,7 @@ it.effect(
           (message) => message.id === `${prior.id}:prompt`,
         )?.role,
       ).toBe("system");
-      expect((yield* projection.getThread(prior.id)).externalSession?.projectionVersion).toBe(4);
+      expect((yield* projection.getThread(prior.id)).externalSession?.projectionVersion).toBe(5);
       yield* restarted.change({ action: "detach", threadId: attached.threadId });
       expect(
         (yield* projection.getThread(attachmentThreadId("/claude", "session", "child-two")))

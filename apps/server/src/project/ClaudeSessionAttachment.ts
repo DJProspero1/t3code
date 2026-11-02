@@ -38,10 +38,13 @@ import * as Source from "./ClaudeAttachmentSource.ts";
 import {
   attachmentEvent,
   attachmentDetails,
+  attachmentReasoningId,
   attachmentNodeId,
   attachmentThreadId,
   projectAttachmentLine,
 } from "./claudeAttachmentProjection.ts";
+
+const PROJECTION_VERSION = 5;
 
 const isSourceError = Schema.is(Source.ClaudeAttachmentSourceError);
 
@@ -258,7 +261,7 @@ const make = Effect.gen(function* () {
         configDirectory,
         transcriptPath: data.transcriptPath,
         attached: true,
-        projectionVersion: 4,
+        projectionVersion: PROJECTION_VERSION,
         state: "connecting",
       },
       lineage: {
@@ -335,7 +338,7 @@ const make = Effect.gen(function* () {
       (!externalSession.attached && state !== "connecting" && state !== "detached") ||
       (externalSession.state === state &&
         (!cursor ||
-          (externalSession.projectionVersion === 4 &&
+          (externalSession.projectionVersion === PROJECTION_VERSION &&
             cursor.offset === externalSession.cursor?.offset &&
             cursor.identity === externalSession.cursor?.identity)) &&
         (!model || model === thread.modelSelection.model))
@@ -356,12 +359,12 @@ const make = Effect.gen(function* () {
               ...externalSession,
               attached: state !== "detached",
               state,
-              ...(cursor ? { cursor, projectionVersion: 4 } : {}),
+              ...(cursor ? { cursor, projectionVersion: PROJECTION_VERSION } : {}),
             },
             updatedAt: now,
           },
           now,
-          `${state}:${externalSession.state}:${externalSession.projectionVersion ?? 0}:4:${cursor?.identity ?? ""}:${cursor?.offset ?? -1}:${model ?? ""}:${DateTime.toEpochMillis(now)}`,
+          `${state}:${externalSession.state}:${externalSession.projectionVersion ?? 0}:${PROJECTION_VERSION}:${cursor?.identity ?? ""}:${cursor?.offset ?? -1}:${model ?? ""}:${DateTime.toEpochMillis(now)}`,
         ),
       ],
     });
@@ -458,6 +461,26 @@ const make = Effect.gen(function* () {
           })).messages
       ).map((message) => [message.id, message]),
     );
+    const reasoningIds = detailsByLine.flatMap((details) =>
+      details?.uuid
+        ? details.thinkingBlocks.map((index) =>
+            attachmentReasoningId(
+              thread.id,
+              details.uuid!,
+              index,
+              aliases.get(claudeLiveMessageEventId(thread.id, details.uuid!)),
+            ),
+          )
+        : [],
+    );
+    const reasoning = new Map(
+      (reasoningIds.length === 0
+        ? []
+        : (yield* projections.getThreadRecords(thread.id, ["turnItems"], {
+            turnItemIds: reasoningIds,
+          })).turnItems
+      ).map((item) => [item.id, item]),
+    );
     let ordinal = offset;
     let lineIndex = 0;
     const tools = new Map<string, OrchestrationV2TurnItem>();
@@ -490,6 +513,7 @@ const make = Effect.gen(function* () {
         }
         const projected = projectAttachmentLine({
           previousTools: tools,
+          previousReasoning: reasoning,
           ...(alias ? { messageId: alias } : {}),
           sentMessage: existingMessage?.creationSource !== "provider" ? existingMessage : undefined,
           thread,
@@ -501,6 +525,8 @@ const make = Effect.gen(function* () {
           includeActivity: false,
         });
         for (const event of projected) {
+          if (event.type === "turn-item.updated" && event.payload.type === "reasoning")
+            reasoning.set(event.payload.id, event.payload);
           if (
             event.type === "turn-item.updated" &&
             event.payload.type === "dynamic_tool" &&
@@ -525,7 +551,9 @@ const make = Effect.gen(function* () {
   ) {
     const external = thread.externalSession!;
     const old =
-      external.projectionVersion === 4 ? (external.cursor ?? { offset: 0 }) : { offset: 0 };
+      external.projectionVersion === PROJECTION_VERSION
+        ? (external.cursor ?? { offset: 0 })
+        : { offset: 0 };
     const read = yield* source.read(external.configDirectory, external.transcriptPath, old);
     const offset = Math.max(
       0,
@@ -735,7 +763,9 @@ const make = Effect.gen(function* () {
             const binding = thread.externalSession!;
             liveRecords.delete(thread.id);
             let cursor =
-              binding.projectionVersion === 4 ? (binding.cursor ?? { offset: 0 }) : { offset: 0 };
+              binding.projectionVersion === PROJECTION_VERSION
+                ? (binding.cursor ?? { offset: 0 })
+                : { offset: 0 };
             let model: string | undefined;
             while (true) {
               const read = yield* source.read(

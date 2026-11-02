@@ -491,3 +491,43 @@ it("activates a preloaded connection without reload and retains its replay epoch
   expect(h.batches.at(-1)?.events.some((event) => event.type === "snapshot")).toBe(true);
   await h.call("session.end", {});
 });
+
+it("includes a turn already running when a preloaded connection is activated", async () => {
+  const h = harness();
+  h.configure(false);
+  await h.call("session.start", {});
+  await h.call("turn.start", { turnId: "already-running" });
+  h.configure(true);
+  h.advance(2001);
+  await h.flush();
+  expect(h.batches[0]?.events.find((event) => event.type === "snapshot")?.payload.rootTurn).toEqual(
+    { turnId: "already-running", state: "running" },
+  );
+  await h.call("turn.complete", { turnId: "already-running", reason: "aborted" });
+  await h.flush();
+  expect(
+    h.batches.at(-1)?.events.find((event) => event.type === "snapshot")?.payload.rootTurn,
+  ).toEqual({ turnId: "already-running", state: "completed", reason: "aborted" });
+});
+
+it("does not publish an invalid identity journal for a step without a content block", async () => {
+  const h = harness();
+  await h.call("session.start", {});
+  const stream = h.call("turn.step", { turnId: "turn", index: 0 }, () =>
+    Object.assign(
+      (async function* () {
+        yield { kind: "engine", ref: 1 };
+      })(),
+      { result: Promise.resolve({ answer: "" }) },
+    ),
+  ) as AsyncIterable<unknown>;
+  for await (const _chunk of stream) {
+    /* consume the native stream */
+  }
+  const message = { type: "assistant", content: [] };
+  await h.call("session.append", { uuid: "empty-block", door: "response", message }, async () => ({
+    uuid: "empty-block",
+    message,
+  }));
+  expect(h.aliases).toHaveLength(0);
+});
