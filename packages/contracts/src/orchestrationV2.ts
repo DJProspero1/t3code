@@ -455,6 +455,19 @@ export const OrchestrationV2AppThread = Schema.Struct({
   branchPullRequest: Schema.optional(Schema.NullOr(ThreadLinkedPullRequest)),
   activeProviderThreadId: Schema.NullOr(ProviderThreadId),
   historyOrigin: Schema.optional(OrchestrationV2ThreadHistoryOrigin),
+  externalSession: Schema.optional(
+    Schema.Struct({
+      provider: Schema.Literal("claude"),
+      sessionId: Schema.String,
+      configDirectory: Schema.String,
+      transcriptPath: Schema.String,
+      attached: Schema.Boolean,
+      cursor: Schema.optional(
+        Schema.Struct({ offset: Schema.Number, identity: Schema.optional(Schema.String) }),
+      ),
+      state: Schema.Literals(["connecting", "following", "unavailable", "detached"]),
+    }),
+  ),
   linkOrigin: Schema.optional(OrchestrationV2LinkOrigin),
   delegatedFrom: Schema.optional(OrchestrationV2DelegatedFrom),
   lineage: OrchestrationV2AppThreadLineage,
@@ -2074,6 +2087,7 @@ export const OrchestrationV2ThreadShell = Schema.Struct({
   title: Schema.String,
   providerInstanceId: ProviderInstanceId,
   modelSelection: ModelSelection,
+  externalSession: OrchestrationV2AppThread.fields.externalSession,
   runtimeMode: RuntimeMode,
   interactionMode: ProviderInteractionMode,
   branch: Schema.NullOr(TrimmedNonEmptyString),

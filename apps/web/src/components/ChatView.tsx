@@ -1,3 +1,4 @@
+import { externalSessionStatusText } from "@t3tools/shared/threadTranscript";
 import { ChildThreadApprovals } from "./chat/ChildThreadApprovals";
 import { workspaceAreaProps } from "../lib/workspaceFocus";
 import { sourceControlClients } from "@t3tools/client-runtime/source-control-clients";
@@ -1713,7 +1714,8 @@ export default function ChatView(props: ChatViewProps) {
   const isGitRepo = liveIsGitRepo ?? recallCheckoutIsRepo(environmentId, gitStatusCwd) ?? true;
   // Provider-native subagents cannot take messages; approvals and questions go to the top-level parent.
   const showProviderSubagentBar = isProviderSubagent;
-  const composerMounted = !showProviderSubagentBar;
+  const externalSession = serverThread?.source.externalSession;
+  const composerMounted = !showProviderSubagentBar && !externalSession;
   const providerSubagentModels = selectedProviderEntry?.models ?? EMPTY_PROVIDER_MODELS;
   // Providers can report dated model ids or aliases.
   const providerSubagentModelSlug = selectedProviderEntry
@@ -3547,7 +3549,14 @@ export default function ChatView(props: ChatViewProps) {
                         aria-busy={queuedRunEdit.isSaving}
                       >
                         <div className="relative z-10">
-                          {showProviderSubagentBar ? (
+                          {externalSession ? (
+                            <div
+                              role={externalSession.state === "unavailable" ? "alert" : "status"}
+                              className="px-5 py-3 text-sm text-muted-foreground"
+                            >
+                              {externalSessionStatusText(externalSession)}
+                            </div>
+                          ) : showProviderSubagentBar ? (
                             <ProviderSubagentBar
                               provider={selectedProviderEntry ?? null}
                               showInstanceBadge={

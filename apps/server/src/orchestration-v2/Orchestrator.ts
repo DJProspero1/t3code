@@ -1,3 +1,4 @@
+import { canMutateExternalSession } from "./externalSessionPolicy.ts";
 import type {
   GuestShareId,
   OrchestrationV2SearchThreadInput,
@@ -342,7 +343,17 @@ export class OrchestratorCommandIdConflictError extends Schema.TaggedError<Orche
   }
 }
 
+export class ExternalSessionReadOnlyError extends Schema.TaggedError<ExternalSessionReadOnlyError>()(
+  "ExternalSessionReadOnlyError",
+  { threadId: ThreadId },
+) {
+  override get message() {
+    return "This thread follows an external Claude session. Send messages and manage agents in Claude Code; T3 will follow their progress.";
+  }
+}
+
 export const OrchestratorV2Error = Schema.Union([
+  ExternalSessionReadOnlyError,
   OrchestratorDispatchError,
   OrchestratorThreadAlreadyExistsError,
   OrchestratorCommandRejectedError,
@@ -12963,6 +12974,17 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       "orchestration_v2.command_type": command.type,
       "orchestration_v2.thread_id": commandThreadId(command),
     });
+
+    if (command.type !== "thread.create" && !canMutateExternalSession(command.type)) {
+      const target = yield* projectionStore.getThread(commandThreadId(command)).pipe(
+        Effect.catchTags({ ProjectionStoreThreadNotFoundError: () => Effect.succeed(null) }),
+        Effect.mapError(
+          (cause) => new OrchestratorProjectionError({ threadId: commandThreadId(command), cause }),
+        ),
+      );
+      if (target?.externalSession)
+        return yield* new ExternalSessionReadOnlyError({ threadId: target.id });
+    }
 
     const events = yield* Ref.make<Array<OrchestrationV2DomainEvent>>([]);
     const effects = yield* Ref.make<Array<PendingOrchestrationEffectV2>>([]);

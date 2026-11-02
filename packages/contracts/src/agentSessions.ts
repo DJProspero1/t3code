@@ -1,5 +1,11 @@
 import * as Schema from "effect/Schema";
-import { IsoDateTime, NonNegativeInt, ProjectId, TrimmedNonEmptyString } from "./baseSchemas.ts";
+import {
+  IsoDateTime,
+  NonNegativeInt,
+  ProjectId,
+  ThreadId,
+  TrimmedNonEmptyString,
+} from "./baseSchemas.ts";
 import { ProviderInstanceId } from "./providerInstance.ts";
 
 export const AgentSessionSource = Schema.Literals(["claudeAgent", "codex", "pi"]);
@@ -53,6 +59,22 @@ export const AgentSessionImportInput = Schema.Struct({
   expectedWorkspaceRoot: Schema.optional(TrimmedNonEmptyString),
 });
 export type AgentSessionImportInput = typeof AgentSessionImportInput.Type;
+
+export const ClaudeSessionAttachmentInput = Schema.Union([
+  Schema.Struct({
+    action: Schema.Literal("attach"),
+    projectId: ProjectId,
+    session: TrimmedNonEmptyString,
+  }),
+  Schema.Struct({ action: Schema.Literal("detach"), threadId: ThreadId }),
+]);
+export type ClaudeSessionAttachmentInput = typeof ClaudeSessionAttachmentInput.Type;
+export const ClaudeSessionAttachmentResult = Schema.Struct({
+  threadId: ThreadId,
+  attached: Schema.Boolean,
+  readOnly: Schema.Literal(true),
+  link: Schema.optional(Schema.String),
+});
 
 export class AgentSessionImportProjectNotFoundError extends Schema.TaggedError<AgentSessionImportProjectNotFoundError>()(
   "AgentSessionImportProjectNotFoundError",

@@ -119,3 +119,34 @@ result that always includes the thread id.
 Approved agents appear under **Settings → Sharing & access** like other clients.
 Revoke one there to cut off its access immediately. A sign-in lasts 30 days;
 after that the agent asks you to approve it again.
+
+## Follow a running Claude session
+
+To view a local Claude Code session and its subagents as a T3 thread while they
+keep running, use its exact live name or session ID:
+
+```sh
+t3 thread attach repair-session --project /path/to/project
+```
+
+Run this on the machine hosting both Claude and T3. The project must already be
+registered with T3. Discovery uses Claude's session registry, so the original
+working directory can be missing. The command prints the thread link. History
+loads in the background; newly created subagents are discovered automatically.
+Closing a T3 client does not stop syncing. The server resumes syncing after a restart.
+
+This is a read-only view of transcript messages and subagent progress. Keep
+sending messages and answering permissions in Claude Code. T3 does not resume the
+session, run another Claude process, or take over its agents. Updates appear when
+Claude writes its transcript, rather than token by token. Tool output and pending
+permission dialogs are not mirrored in this first attachment mode.
+
+To stop syncing while keeping the imported history:
+
+```sh
+t3 thread detach THREAD_ID
+```
+
+Claude and its agents keep running. Repeat `attach` to reconnect the same T3 thread.
+The initial implementation follows the server's default Claude configuration
+folder, including `CLAUDE_CONFIG_DIR` when set.

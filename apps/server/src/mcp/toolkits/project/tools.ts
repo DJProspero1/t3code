@@ -1,5 +1,6 @@
 import { McpAttachmentInput } from "../attachment/input.ts";
 import {
+  ClaudeSessionAttachmentResult,
   NonNegativeInt,
   ModelSelection,
   TrimmedNonEmptyString,
@@ -176,7 +177,22 @@ const ThreadLaunchTool = Tool.make("t3_thread_launch", {
   .annotate(Tool.Destructive, true)
   .annotate(Tool.OpenWorld, true);
 
+const ThreadAttachTool = Tool.make("t3_thread_attach", {
+  ...shared,
+  description:
+    "Attach a live local Claude session as a read-only T3 thread, following its subagents. Use the exact session name or ID. Detach stops following; Claude keeps running.",
+  parameters: Schema.Struct({
+    action: Schema.Literals(["attach", "detach"]),
+    projectId: Schema.optional(ProjectId),
+    session: Schema.optional(TrimmedNonEmptyString),
+    threadId: Schema.optional(ThreadId),
+  }),
+  success: ClaudeSessionAttachmentResult,
+  dependencies: shared.dependencies,
+}).annotate(Tool.Destructive, false);
+
 export const ProjectToolkit = Toolkit.make(
+  ThreadAttachTool,
   ThreadLaunchTool,
   ProjectListTool,
   ProjectReadTool,

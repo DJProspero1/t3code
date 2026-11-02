@@ -1,3 +1,5 @@
+import { Text } from "react-native";
+import { externalSessionStatusText } from "@t3tools/shared/threadTranscript";
 import { ChildThreadApprovals } from "./ChildThreadApprovals";
 import { useOpenThreadInspector } from "./thread-inspector-navigation";
 import { useSidebarWorkspaceTabs } from "../workspace/useSystemWorkspaceTabBar";
@@ -483,6 +485,7 @@ function ThreadDetailBody(
   const defaultComposerEditorRef = useRef<ComposerEditorHandle>(null);
   const composerEditorRef = props.draftMode?.editorRef ?? defaultComposerEditorRef;
   const isProviderSubagent = isProviderNativeSubagentThread(props.selectedThread.source);
+  const externalSession = props.selectedThread.source.externalSession;
   const editingRunId = props.queuedRunEdit?.runId ?? null;
   // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- focuses the composer editor on the next animation frame when a queued run edit starts
   useEffect(() => {
@@ -1701,7 +1704,13 @@ function ThreadDetailBody(
                 </View>
 
                 <View style={composerSlotHidden ? { display: "none" } : undefined}>
-                  {isProviderSubagent ? (
+                  {externalSession ? (
+                    <View className="px-3 py-3" accessibilityLiveRegion="polite">
+                      <Text className="text-sm text-foreground-muted">
+                        {externalSessionStatusText(externalSession)}
+                      </Text>
+                    </View>
+                  ) : isProviderSubagent ? (
                     <View
                       className="self-center px-3 pt-1.5"
                       style={{

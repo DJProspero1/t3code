@@ -1,4 +1,5 @@
 import {
+  ClaudeSessionAttachmentResult,
   OrchestratorMcpFailure,
   OrchestratorMcpThreadListResult,
   OrchestratorMcpThreadReadResult,
@@ -757,9 +758,65 @@ const threadShowCommand = Command.make("show", {
   ),
 );
 
+const threadAttachCommand = Command.make("attach", {
+  ...projectLocationFlags,
+  session: Argument.String("session"),
+  project: Flag.String("project").pipe(Flag.withDefault(".")),
+  json: jsonFlag,
+}).pipe(
+  Command.withDescription(
+    "Follow a running Claude session and its subagents without taking over execution.",
+  ),
+  Command.withHandler((flags) =>
+    withThreadTools(
+      flags,
+      Effect.fn("cli.thread.attach")(function* (tools) {
+        const project = yield* resolveProject(tools, flags.project);
+        const result = yield* tools.call(
+          "t3_thread_attach",
+          { action: "attach", projectId: project.id, session: flags.session },
+          ClaudeSessionAttachmentResult,
+        );
+        yield* flags.json
+          ? printJson(result)
+          : Console.log(
+              `Following Claude in ${result.link ?? result.threadId}. Read-only; Claude keeps running. Detach with: t3 thread detach ${result.threadId}`,
+            );
+      }),
+    ).pipe(reportThreadErrors),
+  ),
+);
+const threadDetachCommand = Command.make("detach", {
+  ...projectLocationFlags,
+  thread: threadArgument,
+  json: jsonFlag,
+}).pipe(
+  Command.withDescription(
+    "Stop following an external Claude session. Its history is kept and Claude keeps running.",
+  ),
+  Command.withHandler((flags) =>
+    withThreadTools(
+      flags,
+      Effect.fn("cli.thread.detach")(function* (tools) {
+        const threadId = yield* decodeThreadId(flags.thread);
+        const result = yield* tools.call(
+          "t3_thread_attach",
+          { action: "detach", threadId },
+          ClaudeSessionAttachmentResult,
+        );
+        yield* flags.json
+          ? printJson(result)
+          : Console.log(`Detached ${result.threadId}. Claude and its subagents keep running.`);
+      }),
+    ).pipe(reportThreadErrors),
+  ),
+);
+
 export const threadCommand = Command.make("thread").pipe(
   Command.withDescription("Start, message, and read threads on the running server."),
   Command.withSubcommands([
+    threadAttachCommand,
+    threadDetachCommand,
     threadListCommand,
     threadStartCommand,
     threadSendCommand,
