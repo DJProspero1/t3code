@@ -4,6 +4,7 @@ import * as Schema from "effect/Schema";
 import { claudeLiveThread as thread } from "./claudeLive.testkit.ts";
 import {
   claudeLiveRequestReply,
+  claudeLiveElicitationAcceptance,
   liveRequestId,
   projectClaudeLiveRequest,
 } from "./claudeLiveRequests.ts";
@@ -96,4 +97,19 @@ it("projects native question cards and returns answers in Claude's format", () =
       },
     }),
   ).toMatchObject({ type: "resolved", response: { answers: { "Which format?": "JSON" } } });
+});
+
+it("accepts supported consent forms without supplying unseen schema defaults", () => {
+  expect(
+    claudeLiveElicitationAcceptance({
+      ...source,
+      kind: "elicitation",
+      payload: {
+        mode: "form",
+        message: "Allow access?",
+        mcp_server_name: "fixture",
+        requested_schema: { type: "object", properties: {} },
+      },
+    }),
+  ).toEqual({ action: "accept", content: {} });
 });

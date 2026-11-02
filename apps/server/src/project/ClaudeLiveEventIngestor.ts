@@ -32,6 +32,7 @@ import {
 
 import {
   liveRequestId,
+  claudeLiveElicitationAcceptance,
   projectClaudeLiveRequest,
   claudeLiveRequestReply,
 } from "./claudeLiveRequests.ts";
@@ -74,6 +75,11 @@ export const layer = Layer.effect(
             current.externalSession.sessionId !== input.request.sessionId
           )
             return yield* new ClaudeLiveTransportError({ reason: "unavailable" });
+          if (
+            input.request.kind === "elicitation" &&
+            claudeLiveElicitationAcceptance(input.request) === undefined
+          )
+            return { type: "resolved" as const, response: { action: "decline" } };
           const id = liveRequestId(current, input.request);
           const existing = yield* projections.getRuntimeRequest(current.id, id);
           if (existing) return claudeLiveRequestReply(input.request, existing);

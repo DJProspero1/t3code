@@ -239,3 +239,51 @@ it.effect("reuses a persisted pending request and delivers its saved answer afte
     ).toHaveLength(1);
   }).pipe(Effect.provide(layer)),
 );
+
+it.effect(
+  "declines unsupported elicitation without displaying an approval that cannot be fulfilled",
+  () =>
+    Effect.gen(function* () {
+      const sink = yield* EventSink.EventSinkV2;
+      const projections = yield* ProjectionStore.ProjectionStoreV2;
+      const ingest = yield* Ingestor.ClaudeLiveEventIngestor;
+      yield* sink.write({
+        events: [attachmentEvent(thread.id, "thread.created", thread, thread.createdAt, "create")],
+      });
+      for (const payload of [
+        {
+          mode: "url",
+          message: "Authorize",
+          mcp_server_name: "fixture",
+          url: "https://example.invalid",
+        },
+        {
+          mode: "form",
+          message: "Enter token",
+          mcp_server_name: "fixture",
+          requested_schema: {
+            type: "object",
+            properties: { token: { type: "string" } },
+            required: ["token"],
+          },
+        },
+      ]) {
+        expect(
+          yield* ingest.request({
+            thread,
+            providerSessionId: ProviderSessionId.make("live-session"),
+            request: {
+              sessionId: "session",
+              epoch: "original-process",
+              requestId: "unsupported",
+              kind: "elicitation",
+              payload,
+            },
+          }),
+        ).toEqual({ type: "resolved", response: { action: "decline" } });
+      }
+      const rows = yield* projections.getThreadRecords(thread.id, ["runtimeRequests", "turnItems"]);
+      expect(rows.runtimeRequests).toHaveLength(0);
+      expect(rows.turnItems).toHaveLength(0);
+    }).pipe(Effect.provide(layer)),
+);

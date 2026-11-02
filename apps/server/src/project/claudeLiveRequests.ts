@@ -151,6 +151,28 @@ export function projectClaudeLiveRequest(input: {
   ];
 }
 
+/** Match the normal Claude adapter: do not offer consent for a form T3 cannot answer. */
+export function claudeLiveElicitationAcceptance(source: ClaudeLiveRequestPayload) {
+  const schema = field(source.payload, "requested_schema");
+  const message = field(source.payload, "message");
+  const serverName = field(source.payload, "mcp_server_name");
+  return typeof schema === "object" &&
+    schema !== null &&
+    !Array.isArray(schema) &&
+    typeof message === "string" &&
+    typeof serverName === "string" &&
+    field(source.payload, "mode") !== "url"
+    ? claudeMcpElicitationAcceptance({
+        mode: "form",
+        message,
+        serverName,
+        requestedSchema: schema as NonNullable<
+          Parameters<typeof claudeMcpElicitationAcceptance>[0]["requestedSchema"]
+        >,
+      })
+    : undefined;
+}
+
 export function claudeLiveRequestReply(
   source: ClaudeLiveRequestPayload,
   request: OrchestrationV2RuntimeRequest,
@@ -172,25 +194,7 @@ export function claudeLiveRequestReply(
           action: request.decision === "cancel" ? "cancel" : "decline",
         },
       };
-    const schema = field(source.payload, "requested_schema");
-    const message = field(source.payload, "message");
-    const serverName = field(source.payload, "mcp_server_name");
-    const acceptance =
-      typeof schema === "object" &&
-      schema !== null &&
-      !Array.isArray(schema) &&
-      typeof message === "string" &&
-      typeof serverName === "string" &&
-      field(source.payload, "mode") !== "url"
-        ? claudeMcpElicitationAcceptance({
-            mode: "form",
-            message,
-            serverName,
-            requestedSchema: schema as NonNullable<
-              Parameters<typeof claudeMcpElicitationAcceptance>[0]["requestedSchema"]
-            >,
-          })
-        : undefined;
+    const acceptance = claudeLiveElicitationAcceptance(source);
     return { type: "resolved", response: acceptance ?? { action: "decline" } };
   }
   const tool = field(source.payload, "tool_name");
