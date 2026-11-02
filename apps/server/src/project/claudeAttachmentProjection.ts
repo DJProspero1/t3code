@@ -67,9 +67,13 @@ export function attachmentDetails(line: string, sessionId: string) {
   const spawn = decodeSpawn(record.value.toolUseResult);
   return {
     uuid: record.value.uuid,
-    toolResults: Array.isArray(record.value.message?.content)
+    toolIds: Array.isArray(record.value.message?.content)
       ? record.value.message.content.flatMap((block) =>
-          block.type === "tool_result" && block.tool_use_id ? [block.tool_use_id] : [],
+          block.type === "tool_result" && block.tool_use_id
+            ? [block.tool_use_id]
+            : block.type === "tool_use" && block.id
+              ? [block.id]
+              : [],
         )
       : [],
     isPeer: record.value.origin?.kind === "peer",
@@ -161,7 +165,7 @@ export function projectAttachmentLine(input: {
         ? "Claude task notification"
         : "Claude internal event";
   const events: Array<OrchestrationV2DomainEvent> = [];
-  const key = attachmentKey("projection-v2", record.uuid, input.line);
+  const key = attachmentKey("projection-v3", record.uuid, input.line);
   if (text) {
     const messageId =
       input.sentMessage?.id ?? input.messageId ?? MessageId.make(`${thread.id}:${record.uuid}`);
@@ -235,7 +239,8 @@ export function projectAttachmentLine(input: {
             ? block.tool_use_id
             : undefined;
       if (!id) continue;
-      const previous = input.previousTools?.get(id);
+      const candidate = input.previousTools?.get(id);
+      const previous = candidate?.type === "dynamic_tool" ? candidate : undefined;
       const result = block.type === "tool_result";
       const item: OrchestrationV2TurnItem = {
         id: TurnItemId.make(`${thread.id}:tool:${id}`),
@@ -251,16 +256,25 @@ export function projectAttachmentLine(input: {
         },
         parentItemId: null,
         ordinal: previous?.ordinal ?? input.ordinal,
-        status: result ? (block.is_error ? "failed" : "completed") : "idle",
-        title: previous?.title ?? block.name ?? "External tool",
-        startedAt: previous?.startedAt ?? at,
-        completedAt: result ? at : null,
-        updatedAt: at,
+        status: result
+          ? block.is_error
+            ? "failed"
+            : "completed"
+          : previous?.completedAt
+            ? previous.status
+            : "idle",
+        title: block.name ?? previous?.title ?? "External tool",
+        startedAt: !result ? at : (previous?.startedAt ?? at),
+        completedAt: result ? at : (previous?.completedAt ?? null),
+        updatedAt: !result && previous?.completedAt ? previous.updatedAt : at,
         type: "dynamic_tool",
-        toolName:
-          previous?.type === "dynamic_tool" ? previous.toolName : block.name?.trim() || null,
-        input: previous?.type === "dynamic_tool" ? previous.input : (block.input ?? null),
-        ...(result ? { output: block.content ?? null } : {}),
+        toolName: block.name?.trim() || previous?.toolName || null,
+        input: block.input ?? previous?.input ?? null,
+        ...(result
+          ? { output: block.content ?? null }
+          : previous?.output !== undefined
+            ? { output: previous.output }
+            : {}),
       };
       events.push(
         attachmentEvent(thread.id, "turn-item.updated", item, at, `tools-v1:${key}:${id}`),

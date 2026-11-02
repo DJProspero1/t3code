@@ -217,7 +217,7 @@ const make = Effect.gen(function* () {
         configDirectory,
         transcriptPath: data.transcriptPath,
         attached: true,
-        projectionVersion: 3,
+        projectionVersion: 4,
         state: "connecting",
       },
       lineage: {
@@ -294,7 +294,7 @@ const make = Effect.gen(function* () {
       (!externalSession.attached && state !== "connecting" && state !== "detached") ||
       (externalSession.state === state &&
         (!cursor ||
-          (externalSession.projectionVersion === 3 &&
+          (externalSession.projectionVersion === 4 &&
             cursor.offset === externalSession.cursor?.offset &&
             cursor.identity === externalSession.cursor?.identity)) &&
         (!model || model === thread.modelSelection.model))
@@ -315,12 +315,12 @@ const make = Effect.gen(function* () {
               ...externalSession,
               attached: state !== "detached",
               state,
-              ...(cursor ? { cursor, projectionVersion: 3 } : {}),
+              ...(cursor ? { cursor, projectionVersion: 4 } : {}),
             },
             updatedAt: now,
           },
           now,
-          `${state}:${externalSession.state}:${externalSession.projectionVersion ?? 0}:3:${cursor?.identity ?? ""}:${cursor?.offset ?? -1}:${model ?? ""}:${DateTime.toEpochMillis(now)}`,
+          `${state}:${externalSession.state}:${externalSession.projectionVersion ?? 0}:4:${cursor?.identity ?? ""}:${cursor?.offset ?? -1}:${model ?? ""}:${DateTime.toEpochMillis(now)}`,
         ),
       ],
     });
@@ -330,17 +330,21 @@ const make = Effect.gen(function* () {
       });
   });
 
-  const followFile = Effect.fn("ClaudeSessionAttachment.followFile")(function* (
+  const liveRecords = new Map<
+    string,
+    { identity?: string; size: number; offsets: Map<string, number> }
+  >();
+  const projectLines = Effect.fn("ClaudeSessionAttachment.projectLines")(function* (
     thread: OrchestrationV2AppThread,
     parent: OrchestrationV2AppThread | null,
     agentId: string | null,
+    lines: ReadonlyArray<string>,
+    offset: number,
+    live = false,
   ) {
     const external = thread.externalSession!;
-    const old =
-      external.projectionVersion === 3 ? (external.cursor ?? { offset: 0 }) : { offset: 0 };
-    const read = yield* source.read(external.configDirectory, external.transcriptPath, old);
     let model: string | undefined;
-    for (const line of read.lines) {
+    for (const line of lines) {
       const details = attachmentDetails(line, external.sessionId);
       if (details?.model) model = details.model;
       if (details?.spawn) {
@@ -367,13 +371,18 @@ const make = Effect.gen(function* () {
           subagentIds: [attachmentNodeId(thread.id)],
         })).subagents[0]
       : undefined;
-    let ordinal = old.offset;
+    let ordinal = offset;
     const tools = new Map<string, OrchestrationV2TurnItem>();
     const events = (yield* Effect.forEach(
-      read.lines,
+      lines,
       Effect.fnUntraced(function* (line) {
         ordinal += Buffer.byteLength(line) + 1;
         const details = attachmentDetails(line, external.sessionId);
+        const offsets = liveRecords.get(thread.id)?.offsets;
+        if (details?.uuid) {
+          if (live) offsets?.set(details.uuid, ordinal);
+          else if ((offsets?.get(details.uuid) ?? -1) > ordinal) return [];
+        }
         const existingMessage =
           details?.isPeer && details.uuid
             ? (yield* projections.getThreadRecords(thread.id, ["messages"], {
@@ -383,7 +392,7 @@ const make = Effect.gen(function* () {
                 ],
               })).messages[0]
             : undefined;
-        for (const toolId of details?.toolResults ?? []) {
+        for (const toolId of details?.toolIds ?? []) {
           if (tools.has(toolId)) continue;
           const previous = yield* projections.getTurnItem({
             threadId: thread.id,
@@ -417,12 +426,39 @@ const make = Effect.gen(function* () {
     )).flat();
     for (let i = 0; i < events.length; i += 100)
       yield* sink.write({ skipExistingEventIds: true, events: events.slice(i, i + 100) });
+    return model;
+  });
+
+  const followFile = Effect.fn("ClaudeSessionAttachment.followFile")(function* (
+    thread: OrchestrationV2AppThread,
+    parent: OrchestrationV2AppThread | null,
+    agentId: string | null,
+  ) {
+    const external = thread.externalSession!;
+    const old =
+      external.projectionVersion === 4 ? (external.cursor ?? { offset: 0 }) : { offset: 0 };
+    const read = yield* source.read(external.configDirectory, external.transcriptPath, old);
+    const offset = Math.max(
+      0,
+      read.cursor.offset -
+        read.lines.reduce((bytes, line) => bytes + Buffer.byteLength(line) + 1, 0),
+    );
+    const model = yield* projectLines(thread, parent, agentId, read.lines, offset);
     yield* setState(thread.id, read.caughtUp ? "following" : "connecting", read.cursor, model);
+    const offsets = liveRecords.get(thread.id)?.offsets;
+    if (offsets)
+      for (const [id, position] of offsets) if (position <= read.cursor.offset) offsets.delete(id);
     return read.caughtUp;
   });
 
   const activitySnapshots = new Map<string, string>();
-  type Tail = { lines: ReadonlyArray<string>; size: number; modifiedAt: number; identity?: string };
+  type Tail = {
+    lines: ReadonlyArray<string>;
+    offset: number;
+    size: number;
+    modifiedAt: number;
+    identity?: string;
+  };
   const refreshActivity = Effect.fn("ClaudeSessionAttachment.refreshActivity")(function* (
     thread: OrchestrationV2AppThread,
     parent: OrchestrationV2AppThread | null,
@@ -439,6 +475,16 @@ const make = Effect.gen(function* () {
         : ("idle" as const);
     const stamp = `${tail.identity ?? ""}:${tail.size}:${tail.modifiedAt}:${activityStatus}:${thread.lineage.parentThreadId}`;
     if (activitySnapshots.get(thread.id) === stamp) return false;
+    // Publish current messages before historical backfill, without advancing its cursor.
+    const previousLive = liveRecords.get(thread.id);
+    if (!previousLive || previousLive.identity !== tail.identity || previousLive.size > tail.size)
+      liveRecords.set(thread.id, {
+        ...(tail.identity ? { identity: tail.identity } : {}),
+        size: tail.size,
+        offsets: new Map(),
+      });
+    else previousLive.size = tail.size;
+    yield* projectLines(thread, parent, agentId, tail.lines, tail.offset, true);
     const previousSubagent = parent
       ? (yield* projections.getThreadRecords(parent.id, ["subagents"], {
           subagentIds: [attachmentNodeId(thread.id)],
@@ -481,6 +527,7 @@ const make = Effect.gen(function* () {
     if (!rows.length) {
       activitySnapshots.clear();
       syncedFiles.clear();
+      liveRecords.clear();
     }
     for (const row of rows) {
       const thread = yield* projections.getThread(ThreadId.make(row.thread_id));

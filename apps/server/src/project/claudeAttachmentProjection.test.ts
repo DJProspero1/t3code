@@ -120,7 +120,30 @@ describe("external Claude projection", () => {
       input: { file_path: "file.txt" },
       output: "File contents",
     });
-    for (const event of [...call, ...result]) expect(isEvent(event)).toBe(true);
+    const completed = result.find((event) => event.type === "turn-item.updated")!.payload;
+    const lateCall = projectAttachmentLine({
+      thread,
+      parent: null,
+      agentId: null,
+      ordinal: 10,
+      includeActivity: false,
+      previousTools: new Map([["call-1", completed]]),
+      line: JSON.stringify({
+        ...record,
+        uuid: "tool-call",
+        message: {
+          content: [
+            { type: "tool_use", id: "call-1", name: "Read", input: { file_path: "file.txt" } },
+          ],
+        },
+      }),
+    });
+    expect(lateCall[0]?.payload).toMatchObject({
+      status: "completed",
+      output: "File contents",
+      input: { file_path: "file.txt" },
+    });
+    for (const event of [...call, ...result, ...lateCall]) expect(isEvent(event)).toBe(true);
   });
 
   it("projects native child history and completion without creating a provider turn or replaying a prompt", () => {

@@ -145,7 +145,10 @@ Your messages retain their original wording. Claude task notifications, peer mes
 and context summaries are classified as system activity, not as messages you sent.
 Older imports are repaired in the background after an upgrade.
 
-History loads separately from current activity. Completed subagents are shown as
+Recent messages and current activity are read before historical backfill, for both
+the root and its subagents. New messages do not wait for a child’s history-import
+batch. This follows complete transcript records through polling, not token-level
+streaming. Completed subagents are shown as
 completed even while their older messages are still importing. A child with no
 recent activity and no recorded final outcome is shown as idle, not assumed to be
 running. Tool calls and their results appear in the timeline. Pending permission

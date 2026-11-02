@@ -45,7 +45,13 @@ export class ClaudeAttachmentSource extends Context.Service<
       home: string,
       path: string,
     ) => Effect.Effect<
-      { lines: ReadonlyArray<string>; size: number; modifiedAt: number; identity?: string },
+      {
+        lines: ReadonlyArray<string>;
+        offset: number;
+        size: number;
+        modifiedAt: number;
+        identity?: string;
+      },
       ClaudeAttachmentSourceError
     >;
     readonly discover: (
@@ -102,7 +108,13 @@ export const layer = Layer.sync(ClaudeAttachmentSource, () => {
     string,
     {
       stamp: string;
-      result: { lines: string[]; size: number; modifiedAt: number; identity: string };
+      result: {
+        lines: string[];
+        offset: number;
+        size: number;
+        modifiedAt: number;
+        identity: string;
+      };
     }
   >();
 
@@ -123,11 +135,15 @@ export const layer = Layer.sync(ClaudeAttachmentSource, () => {
             const complete = buffer.subarray(0, bytesRead);
             const end = complete.lastIndexOf(10);
             const start = offset ? complete.indexOf(10) + 1 : 0;
+            const completeLines =
+              end >= start ? complete.subarray(start, end).toString("utf8").split("\n") : [];
+            const omitted = completeLines.slice(0, -64);
             const result = {
-              lines:
-                end >= start
-                  ? complete.subarray(start, end).toString("utf8").split("\n").slice(-64)
-                  : [],
+              lines: completeLines.slice(-64),
+              offset:
+                offset +
+                start +
+                omitted.reduce((bytes, line) => bytes + Buffer.byteLength(line) + 1, 0),
               identity: `${stat.dev}:${stat.ino}`,
               size: stat.size,
               modifiedAt: stat.mtimeMs,

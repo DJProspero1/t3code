@@ -39,6 +39,7 @@ it.effect(
       const projectId = ProjectId.make("project");
       const files = new Map<string, string[]>();
       let readCalls = 0;
+      let chunkSize = Infinity;
       const rootPath = "/claude/projects/project/session.jsonl";
       const childPath = (id: string) => `${rootPath.slice(0, -6)}/subagents/agent-${id}.jsonl`;
       const rootLine = JSON.stringify({
@@ -73,7 +74,10 @@ it.effect(
           ),
         tail: (_home, path) =>
           Effect.sync(() => ({
-            lines: files.get(path) ?? [],
+            lines: (files.get(path) ?? []).slice(-2),
+            offset: (files.get(path) ?? [])
+              .slice(0, -2)
+              .reduce((bytes, line) => bytes + Buffer.byteLength(line) + 1, 0),
             size: (files.get(path) ?? []).join("\n").length,
             modifiedAt: 1,
           })),
@@ -82,9 +86,9 @@ it.effect(
             readCalls++;
             const lines = files.get(path) ?? [];
             return {
-              lines: lines.slice(cursor.offset),
-              cursor: { offset: lines.length },
-              caughtUp: true,
+              lines: lines.slice(cursor.offset, cursor.offset + chunkSize),
+              cursor: { offset: Math.min(lines.length, cursor.offset + chunkSize) },
+              caughtUp: cursor.offset + chunkSize >= lines.length,
             };
           }),
       });
@@ -220,7 +224,7 @@ it.effect(
       expect((yield* projection.getThreadRecords(prior.id, ["messages"])).messages[0]?.role).toBe(
         "system",
       );
-      expect((yield* projection.getThread(prior.id)).externalSession?.projectionVersion).toBe(3);
+      expect((yield* projection.getThread(prior.id)).externalSession?.projectionVersion).toBe(4);
       yield* restarted.change({ action: "detach", threadId: attached.threadId });
       expect(
         (yield* projection.getThread(attachmentThreadId("/claude", "session", "child-two")))
@@ -300,5 +304,47 @@ it.effect(
       const caughtUpReads = readCalls;
       yield* restarted.sync;
       expect(readCalls).toBe(caughtUpReads);
+      // Recent messages must not wait for either the root's history cursor or the child batch.
+      chunkSize = 1;
+      for (let i = 0; i < 10; i++) {
+        const record = JSON.parse(reply(`new-root-${i}`));
+        record.timestamp = `2026-11-02T12:00:${String(i).padStart(2, "0")}Z`;
+        files.get(rootPath)!.push(JSON.stringify(record));
+      }
+      const revised = JSON.parse(reply("new-root-0"));
+      revised.message.content = "Updated live text";
+      revised.timestamp = "2026-11-02T12:01:00Z";
+      files.get(rootPath)!.push(JSON.stringify(revised));
+      for (let i = 0; i < 80; i++)
+        for (let j = 0; j < 10; j++)
+          files.get(childPath(`large-tree-${i}`))!.push(reply(`new-child-${i}-${j}`));
+      yield* restarted.sync;
+      expect((yield* projection.getThread(work.threadId)).externalSession?.state).toBe(
+        "connecting",
+      );
+      expect(
+        (yield* projection.getThreadRecords(work.threadId, ["messages"])).messages.some((m) =>
+          m.id.endsWith(":new-root-9"),
+        ),
+      ).toBe(true);
+      expect(
+        (yield* projection.getThreadRecords(work.threadId, ["messages"])).messages.find((m) =>
+          m.id.endsWith(":new-root-0"),
+        )?.text,
+      ).toBe("Updated live text");
+      yield* restarted.sync;
+      const items = (yield* projection.getThreadRecords(work.threadId, ["turnItems"])).turnItems;
+      const oldItem = items.find((item) => item.id.endsWith(":new-root-1:item"))!;
+      const recentItem = items.find((item) => item.id.endsWith(":new-root-9:item"))!;
+      expect(oldItem).toBeDefined();
+      expect(oldItem.ordinal).toBeLessThan(recentItem.ordinal);
+      for (let i = 0; i < 80; i++) {
+        const id = attachmentThreadId("/claude-work", "session", `large-tree-${i}`);
+        expect(
+          (yield* projection.getThreadRecords(id, ["messages"])).messages.some((m) =>
+            m.id.endsWith(`:new-child-${i}-9`),
+          ),
+        ).toBe(true);
+      }
     }).pipe(Effect.provide(persistence)),
 );

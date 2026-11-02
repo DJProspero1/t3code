@@ -339,7 +339,27 @@ const layerBase: Layer.Layer<
         });
       });
 
-    const normalizeEvents = (events: ReadonlyArray<OrchestrationV2DomainEvent>) => {
+    const normalizeEvents = Effect.fnUntraced(function* (
+      events: ReadonlyArray<OrchestrationV2DomainEvent>,
+    ) {
+      const candidates = [
+        ...new Set(
+          events.flatMap((event) =>
+            event.type === "turn-item.updated" && event.payload.runId === null
+              ? [event.threadId]
+              : [],
+          ),
+        ),
+      ];
+      const sourceOrdered = new Set(
+        candidates.length === 0
+          ? []
+          : (yield* sql<{ thread_id: string }>`
+        SELECT thread_id FROM orchestration_v2_projection_threads
+        WHERE thread_id IN (SELECT value FROM json_each(${encodeEventIds(candidates)}))
+          AND json_extract(payload_json, '$.externalSession') IS NOT NULL
+      `).map((row) => row.thread_id),
+      );
       const runOrdinals = new Map(
         events.flatMap((event) =>
           event.type === "run.created" || event.type === "run.updated"
@@ -347,7 +367,7 @@ const layerBase: Layer.Layer<
             : [],
         ),
       );
-      return Effect.forEach(
+      return yield* Effect.forEach(
         events,
         (event): Effect.Effect<OrchestrationV2DomainEvent, unknown> =>
           event.type === "turn-item.updated"
@@ -355,12 +375,13 @@ const layerBase: Layer.Layer<
                 .normalize(
                   event.payload,
                   event.payload.runId === null ? undefined : runOrdinals.get(event.payload.runId),
+                  sourceOrdered.has(event.threadId),
                 )
                 .pipe(Effect.map((payload) => ({ ...event, payload })))
             : Effect.succeed(event),
         { concurrency: 1 },
       );
-    };
+    });
 
     const applyStoredEvents =
       /* This helper runs for individual orchestration events; the enclosing operation owns the span. */
