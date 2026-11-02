@@ -95,7 +95,8 @@ export const layer = McpToolAccess.toLayer(ProjectToolkit, {
           () =>
             new OrchestratorMcpFailure({
               code: "invalid_request",
-              message: "Attach requires projectId and session; detach requires threadId.",
+              message:
+                "Attach requires projectId and session; detach and handoff require threadId.",
             }),
         ),
       );

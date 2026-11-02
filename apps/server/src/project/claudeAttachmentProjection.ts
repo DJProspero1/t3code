@@ -22,6 +22,7 @@ const Record = Schema.Struct({
   uuid: Schema.optional(Schema.String),
   timestamp: Schema.optional(Schema.String),
   sessionId: Schema.optional(Schema.String),
+  cwd: Schema.optional(Schema.String),
   isMeta: Schema.optional(Schema.Boolean),
   isCompactSummary: Schema.optional(Schema.Boolean),
   isVisibleInTranscriptOnly: Schema.optional(Schema.Boolean),
@@ -66,6 +67,7 @@ export function attachmentDetails(line: string, sessionId: string) {
   if (Option.isNone(record) || record.value.sessionId !== sessionId) return null;
   const spawn = decodeSpawn(record.value.toolUseResult);
   return {
+    cwd: record.value.cwd,
     uuid: record.value.uuid,
     toolIds: Array.isArray(record.value.message?.content)
       ? record.value.message.content.flatMap((block) =>

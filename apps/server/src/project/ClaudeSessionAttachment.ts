@@ -41,14 +41,20 @@ import {
   projectAttachmentLine,
 } from "./claudeAttachmentProjection.ts";
 
+const isSourceError = Schema.is(Source.ClaudeAttachmentSourceError);
+
 export class ClaudeSessionAttachmentError extends Schema.TaggedError<ClaudeSessionAttachmentError>()(
   "ClaudeSessionAttachmentError",
   {
     cause: Schema.Defect(),
-    reason: Schema.optional(Schema.Literals(["unsupported-provider", "unavailable-instance"])),
+    reason: Schema.optional(
+      Schema.Literals(["unsupported-provider", "unavailable-instance", "handoff-blocked"]),
+    ),
   },
 ) {
   override get message() {
+    if (isSourceError(this.cause)) return this.cause.message;
+    if (this.reason === "handoff-blocked" && typeof this.cause === "string") return this.cause;
     if (this.reason === "unsupported-provider")
       return "Live attachment is not implemented for this provider. The existing session was not changed.";
     if (this.reason === "unavailable-instance")
@@ -87,7 +93,39 @@ const make = Effect.gen(function* () {
   const path = yield* Path.Path;
   const settings = yield* ServerSettings.ServerSettingsService;
   const gate = yield* Semaphore.make(1);
+  const handoffGate = yield* Semaphore.make(1);
   const syncedFiles = new Map<string, string>();
+
+  const resolveConfigDirectory = Effect.fn("ClaudeSessionAttachment.resolveConfigDirectory")(
+    function* (providerInstanceId: ProviderInstanceId) {
+      const configured = (yield* settings.getSettings).providerInstances[providerInstanceId];
+      if (configured && configured.driver !== "claudeAgent")
+        return yield* new ClaudeSessionAttachmentError({
+          reason: "unsupported-provider",
+          cause: "Provider has no live attachment adapter",
+        });
+      if (
+        (!configured && providerInstanceId !== "claudeAgent") ||
+        (configured && !resolveProviderInstanceEnabled(configured))
+      )
+        return yield* new ClaudeSessionAttachmentError({
+          reason: "unavailable-instance",
+          cause: "Provider instance is missing or disabled",
+        });
+      const config = yield* decodeClaudeSettings(configured?.config ?? {});
+      const instanceEnvironment = yield* mergeProviderInstanceEnvironment(
+        configured?.environment,
+        environment,
+      ).pipe(
+        Effect.provideService(HostProcess.HomeDirectory, home),
+        Effect.provideService(HostProcess.Platform, platform),
+      );
+      return yield* resolveClaudeHomePath(config, instanceEnvironment).pipe(
+        Effect.provideService(Path.Path, path),
+        Effect.provideService(HostProcess.HomeDirectory, home),
+      );
+    },
+  );
 
   const create = Effect.fn("ClaudeSessionAttachment.create")(function* (
     parent: OrchestrationV2AppThread | null,
@@ -601,6 +639,170 @@ const make = Effect.gen(function* () {
 
   const change = Effect.fn("ClaudeSessionAttachment.change")(
     function* (input: ClaudeSessionAttachmentInput) {
+      if (input.action === "handoff") {
+        const initial = yield* projections.getThread(input.threadId);
+        const external = initial.externalSession;
+        if (!external && initial.lineage.parentThreadId === null && initial.deletedAt === null)
+          return { threadId: initial.id, attached: false, readOnly: false };
+        if (!external || initial.lineage.parentThreadId !== null || initial.deletedAt !== null)
+          return yield* new ClaudeSessionAttachmentError({
+            reason: "handoff-blocked",
+            cause: "Handoff requires an attached root thread",
+          });
+        const configDirectory = yield* resolveConfigDirectory(initial.providerInstanceId);
+        if (path.resolve(configDirectory) !== path.resolve(external.configDirectory))
+          return yield* new ClaudeSessionAttachmentError({
+            reason: "handoff-blocked",
+            cause:
+              "The provider account changed since attachment. Restore its original configuration before handoff.",
+          });
+        yield* source.assertStopped(external.configDirectory, external.sessionId);
+        // Block new inbox sends before draining history; failed handoffs remain detached for retry.
+        yield* setState(initial.id, "detached").pipe(gate.withPermit);
+        const pending = yield* sql<{ effect_id: string }>`
+          SELECT effect_id FROM orchestration_v2_effect_outbox
+          WHERE thread_id = ${initial.id} AND effect_type = 'external-session.send'
+            AND status IN ('pending', 'running') LIMIT 1
+        `;
+        if (pending.length)
+          return yield* new ClaudeSessionAttachmentError({
+            reason: "handoff-blocked",
+            cause: "Wait for pending inbox deliveries to settle before retrying handoff",
+          });
+        let cwd: string | undefined;
+        const firstRecords = yield* source.read(external.configDirectory, external.transcriptPath, {
+          offset: 0,
+        });
+        for (const line of firstRecords.lines)
+          cwd = attachmentDetails(line, external.sessionId)?.cwd ?? cwd;
+        const importRemaining = Effect.fn("ClaudeSessionAttachment.importHandoffHistory")(
+          function* (
+            thread: OrchestrationV2AppThread,
+            parent: OrchestrationV2AppThread | null,
+            agentId: string | null,
+          ) {
+            const binding = thread.externalSession!;
+            liveRecords.delete(thread.id);
+            let cursor =
+              binding.projectionVersion === 4 ? (binding.cursor ?? { offset: 0 }) : { offset: 0 };
+            let model: string | undefined;
+            while (true) {
+              const read = yield* source.read(
+                binding.configDirectory,
+                binding.transcriptPath,
+                cursor,
+              );
+              const start =
+                read.cursor.offset -
+                read.lines.reduce((bytes, line) => bytes + Buffer.byteLength(line) + 1, 0);
+              model = (yield* projectLines(thread, parent, agentId, read.lines, start)) ?? model;
+              if (parent === null)
+                for (const line of read.lines)
+                  cwd = attachmentDetails(line, binding.sessionId)?.cwd ?? cwd;
+              cursor = read.cursor;
+              if (read.caughtUp) break;
+              yield* Effect.yieldNow;
+            }
+            const tail = yield* source.tail(binding.configDirectory, binding.transcriptPath);
+            if (
+              cursor.offset !== tail.size ||
+              (cursor.identity && cursor.identity !== tail.identity)
+            )
+              return yield* new ClaudeSessionAttachmentError({
+                reason: "handoff-blocked",
+                cause:
+                  "Transcript changed or has an incomplete final record; retry after Claude exits cleanly",
+              });
+            if (parent === null)
+              for (const line of tail.lines)
+                cwd = attachmentDetails(line, binding.sessionId)?.cwd ?? cwd;
+            yield* setState(thread.id, "detached", cursor, model);
+          },
+        );
+        yield* importRemaining(initial, null, null);
+        for (const child of yield* source.children(
+          external.configDirectory,
+          external.transcriptPath,
+        )) {
+          const thread = yield* create(initial, {
+            configDirectory: external.configDirectory,
+            providerInstanceId: initial.providerInstanceId,
+            sessionId: external.sessionId,
+            transcriptPath: child.path,
+            title: `Claude subagent ${child.agentId}`,
+            projectId: initial.projectId,
+            agentId: child.agentId,
+          });
+          yield* importRemaining(thread, initial, child.agentId);
+        }
+        const descendants = yield* sql<{ thread_id: string }>`
+          SELECT thread_id FROM orchestration_v2_projection_threads
+          WHERE json_extract(payload_json, '$.lineage.rootThreadId') = ${initial.id}
+            AND json_extract(payload_json, '$.externalSession') IS NOT NULL
+        `;
+        for (const row of descendants) {
+          const thread = yield* projections.getThread(ThreadId.make(row.thread_id));
+          yield* setState(thread.id, "detached");
+          const records = yield* projections.getThreadRecords(thread.id, ["nodes", "subagents"]);
+          const at = yield* DateTime.now;
+          const events = [
+            ...records.nodes
+              .filter((node) => node.status === "running")
+              .map((node) =>
+                attachmentEvent(
+                  thread.id,
+                  "node.updated",
+                  { ...node, status: "idle" },
+                  at,
+                  `handoff:${node.id}`,
+                ),
+              ),
+            ...records.subagents
+              .filter((agent) => agent.status === "running")
+              .map((agent) =>
+                attachmentEvent(
+                  thread.id,
+                  "subagent.updated",
+                  {
+                    ...agent,
+                    status: "idle",
+                    updatedAt: at,
+                    progress: "Original Claude process exited; final outcome was not recorded.",
+                  },
+                  at,
+                  `handoff:${agent.id}`,
+                ),
+              ),
+          ];
+          if (events.length) yield* sink.write({ events, skipExistingEventIds: true });
+        }
+        yield* source.assertStopped(external.configDirectory, external.sessionId);
+        if (!cwd || !path.isAbsolute(cwd))
+          return yield* new ClaudeSessionAttachmentError({
+            reason: "handoff-blocked",
+            cause: "The original workspace could not be determined from the transcript",
+          });
+        const current = yield* projections.getThread(initial.id);
+        const now = yield* DateTime.now;
+        const committed = yield* sink.write({
+          expectedThread: current,
+          events: [
+            attachmentEvent(
+              current.id,
+              "thread.metadata-updated",
+              { ...current, externalSession: undefined, worktreePath: cwd, updatedAt: now },
+              now,
+              `handoff:${DateTime.toEpochMillis(now)}`,
+            ),
+          ],
+        });
+        if (!committed.length)
+          return yield* new ClaudeSessionAttachmentError({
+            reason: "handoff-blocked",
+            cause: "Thread changed during handoff",
+          });
+        return { threadId: current.id, attached: false, readOnly: false };
+      }
       if (input.action === "detach") {
         const thread = yield* projections.getThread(input.threadId);
         if (!thread.externalSession || thread.lineage.parentThreadId !== null) {
@@ -622,32 +824,7 @@ const make = Effect.gen(function* () {
       if (Option.isNone(project))
         return yield* new ClaudeSessionAttachmentError({ cause: "Project does not exist" });
       const providerInstanceId = input.providerInstanceId ?? ProviderInstanceId.make("claudeAgent");
-      const configured = (yield* settings.getSettings).providerInstances[providerInstanceId];
-      if (configured && configured.driver !== "claudeAgent")
-        return yield* new ClaudeSessionAttachmentError({
-          reason: "unsupported-provider",
-          cause: "Provider has no live attachment adapter",
-        });
-      if (
-        (!configured && providerInstanceId !== "claudeAgent") ||
-        (configured && !resolveProviderInstanceEnabled(configured))
-      )
-        return yield* new ClaudeSessionAttachmentError({
-          reason: "unavailable-instance",
-          cause: "Provider instance is missing or disabled",
-        });
-      const config = yield* decodeClaudeSettings(configured?.config ?? {});
-      const instanceEnvironment = yield* mergeProviderInstanceEnvironment(
-        configured?.environment,
-        environment,
-      ).pipe(
-        Effect.provideService(HostProcess.HomeDirectory, home),
-        Effect.provideService(HostProcess.Platform, platform),
-      );
-      const configDirectory = yield* resolveClaudeHomePath(config, instanceEnvironment).pipe(
-        Effect.provideService(Path.Path, path),
-        Effect.provideService(HostProcess.HomeDirectory, home),
-      );
+      const configDirectory = yield* resolveConfigDirectory(providerInstanceId);
       const discovered = yield* source.discover(configDirectory, input.session);
       const thread = yield* create(null, {
         ...discovered,
@@ -658,7 +835,8 @@ const make = Effect.gen(function* () {
       yield* setState(thread.id, "connecting");
       return { threadId: thread.id, attached: true, readOnly: false };
     },
-    gate.withPermit,
+    // Large stopped-session imports must not stall live followers of other sessions.
+    (effect, input) => (input.action === "handoff" ? handoffGate : gate).withPermit(effect),
     Effect.mapError((cause) =>
       isAttachmentError(cause) ? cause : new ClaudeSessionAttachmentError({ cause }),
     ),

@@ -161,6 +161,22 @@ t3 thread detach THREAD_ID
 ```
 
 Claude and its agents keep running. Repeat `attach` to reconnect the same T3 thread.
+
+To continue the conversation through T3's normal Claude controls, first let its work
+finish and exit the original Claude session, then run:
+
+```sh
+t3 thread handoff THREAD_ID
+```
+
+Handoff imports the remaining history and keeps the same T3 thread and native
+Claude conversation. Your next message starts Claude through T3, with its normal
+streaming, approval and interruption controls. Previous subagents remain as
+history; their processes are not restored. Newly spawned agents use the normal
+T3 integration. The command refuses a running source process, even when it looks
+idle. It does not terminate Claude or detect that all of its work is finished.
+
+This handoff currently supports attached Claude sessions only.
 Use `--provider INSTANCE_ID` to select another configured Claude account. Attachment
 uses that instance's home folder and environment settings. A disabled or different
 provider is rejected before any thread is created. The default instance is `claudeAgent`.

@@ -181,9 +181,9 @@ const ThreadLaunchTool = Tool.make("t3_thread_launch", {
 const ThreadAttachTool = Tool.make("t3_thread_attach", {
   ...shared,
   description:
-    "Attach a live local Claude session as a T3 thread with text messaging and subagent history. Use the exact session name or ID. Detach stops following; Claude keeps running.",
+    "Attach a live local Claude session as a T3 thread with text messaging and subagent history. Use the exact session name or ID. Detach stops following; Claude keeps running. Handoff resumes through T3 after the original Claude process has exited; it does not stop that process.",
   parameters: Schema.Struct({
-    action: Schema.Literals(["attach", "detach"]),
+    action: Schema.Literals(["attach", "detach", "handoff"]),
     projectId: Schema.optional(ProjectId),
     session: Schema.optional(TrimmedNonEmptyString),
     providerInstanceId: Schema.optional(ProviderInstanceId),

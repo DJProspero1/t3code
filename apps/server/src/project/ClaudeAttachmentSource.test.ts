@@ -29,6 +29,25 @@ const fixture = Effect.acquireRelease(
   (f) => Effect.promise(() => NodeFSP.rm(f.home, { recursive: true, force: true })),
 );
 
+it.effect("refuses handoff while the registered process is alive, including an idle owner", () =>
+  Effect.gen(function* () {
+    const f = yield* fixture;
+    const source = yield* Source.ClaudeAttachmentSource;
+    const error = yield* source.assertStopped(f.home, f.sessionId).pipe(Effect.flip);
+    expect(error.operation).toBe("handoff");
+    yield* Effect.promise(() =>
+      NodeFSP.unlink(NodePath.join(f.home, "sessions", `${process.pid}.json`)),
+    );
+    yield* source.assertStopped(f.home, f.sessionId);
+    yield* Effect.promise(() =>
+      NodeFSP.writeFile(NodePath.join(f.home, "sessions", "999999.json"), "{"),
+    );
+    expect((yield* source.assertStopped(f.home, f.sessionId).pipe(Effect.flip)).operation).toBe(
+      "handoff",
+    );
+  }).pipe(Effect.provide(Source.layer)),
+);
+
 it.effect(
   "finds the exact live session even when its workspace was deleted and discovers new subagents",
   () =>

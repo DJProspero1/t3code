@@ -68,6 +68,7 @@ export const ClaudeSessionAttachmentInput = Schema.Union([
     providerInstanceId: Schema.optional(ProviderInstanceId),
   }),
   Schema.Struct({ action: Schema.Literal("detach"), threadId: ThreadId }),
+  Schema.Struct({ action: Schema.Literal("handoff"), threadId: ThreadId }),
 ]);
 export type ClaudeSessionAttachmentInput = typeof ClaudeSessionAttachmentInput.Type;
 export const ClaudeSessionAttachmentResult = Schema.Struct({

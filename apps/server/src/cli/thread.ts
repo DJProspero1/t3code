@@ -821,11 +821,40 @@ const threadDetachCommand = Command.make("detach", {
   ),
 );
 
+const threadHandoffCommand = Command.make("handoff", {
+  ...projectLocationFlags,
+  thread: threadArgument,
+  json: jsonFlag,
+}).pipe(
+  Command.withDescription(
+    "Continue an attached Claude conversation through T3 after Claude and its agents have exited.",
+  ),
+  Command.withHandler((flags) =>
+    withThreadTools(
+      flags,
+      Effect.fn("cli.thread.handoff")(function* (tools) {
+        const threadId = yield* decodeThreadId(flags.thread);
+        const result = yield* tools.call(
+          "t3_thread_attach",
+          { action: "handoff", threadId },
+          ClaudeSessionAttachmentResult,
+        );
+        yield* flags.json
+          ? printJson(result)
+          : Console.log(
+              `Continue in ${result.link ?? result.threadId}. T3 will resume the conversation on your next message.`,
+            );
+      }),
+    ).pipe(reportThreadErrors),
+  ),
+);
+
 export const threadCommand = Command.make("thread").pipe(
   Command.withDescription("Start, message, and read threads on the running server."),
   Command.withSubcommands([
     threadAttachCommand,
     threadDetachCommand,
+    threadHandoffCommand,
     threadListCommand,
     threadStartCommand,
     threadSendCommand,

@@ -2,6 +2,7 @@
 import * as NodeFSP from "node:fs/promises";
 // @effect-diagnostics-next-line nodeBuiltinImport:off - native paths are used inside the filesystem adapter.
 import * as NodePath from "node:path";
+import * as HostProcess from "@t3tools/shared/HostProcess";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
@@ -25,11 +26,13 @@ const MAX_LINE_BYTES = 8 * 1024 * 1024;
 export class ClaudeAttachmentSourceError extends Schema.TaggedError<ClaudeAttachmentSourceError>()(
   "ClaudeAttachmentSourceError",
   {
-    operation: Schema.Literals(["discover", "read", "subagents"]),
+    operation: Schema.Literals(["discover", "read", "subagents", "handoff"]),
     cause: Schema.Defect(),
   },
 ) {
   override get message() {
+    if (this.operation === "handoff")
+      return "Handoff requires the original Claude session to have exited after its agents finish. T3 will not stop a process based on transcript inactivity.";
     return `Could not ${this.operation} the Claude session. Check that it is running locally and its transcript is readable.`;
   }
 }
@@ -41,6 +44,10 @@ export interface TranscriptCursor {
 export class ClaudeAttachmentSource extends Context.Service<
   ClaudeAttachmentSource,
   {
+    readonly assertStopped: (
+      home: string,
+      sessionId: string,
+    ) => Effect.Effect<void, ClaudeAttachmentSourceError>;
     readonly tail: (
       home: string,
       path: string,
@@ -119,6 +126,46 @@ export const layer = Layer.sync(ClaudeAttachmentSource, () => {
   >();
 
   return ClaudeAttachmentSource.of({
+    assertStopped: Effect.fn("ClaudeAttachmentSource.assertStopped")(function* (home, sessionId) {
+      const platform = yield* HostProcess.Platform;
+      return yield* Effect.tryPromise({
+        try: async () => {
+          // A quiet transcript cannot establish that background agents have stopped.
+          for (const name of await NodeFSP.readdir(NodePath.join(home, "sessions"))) {
+            if (!/^\d+\.json$/.test(name)) continue;
+            let session;
+            try {
+              session = decodeSession(
+                await NodeFSP.readFile(NodePath.join(home, "sessions", name), "utf8"),
+              );
+            } catch (cause) {
+              if ((cause as NodeJS.ErrnoException).code === "ENOENT") continue;
+              throw cause;
+            }
+            if (session.sessionId !== sessionId) continue;
+            if (session.pid <= 0) throw new Error("Invalid session owner");
+            try {
+              process.kill(session.pid, 0);
+            } catch (cause) {
+              if ((cause as NodeJS.ErrnoException).code === "ESRCH") continue;
+              throw cause;
+            }
+            if (platform === "linux" && session.procStart) {
+              try {
+                const stat = await NodeFSP.readFile(`/proc/${session.pid}/stat`, "utf8");
+                if (stat.slice(stat.lastIndexOf(")") + 2).split(" ")[19] !== session.procStart)
+                  continue;
+              } catch (cause) {
+                if ((cause as NodeJS.ErrnoException).code === "ENOENT") continue;
+                throw cause;
+              }
+            }
+            throw new Error("The original session still has a live owner");
+          }
+        },
+        catch: (cause) => new ClaudeAttachmentSourceError({ operation: "handoff", cause }),
+      });
+    }),
     tail: Effect.fn("ClaudeAttachmentSource.tail")((home, path) =>
       Effect.tryPromise({
         try: async () => {
