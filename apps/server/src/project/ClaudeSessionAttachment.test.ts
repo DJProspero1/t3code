@@ -20,6 +20,7 @@ import { ServerActivation } from "../serverActivation.ts";
 import * as ServerSettings from "../serverSettings.ts";
 import * as Source from "./ClaudeAttachmentSource.ts";
 import * as Attachment from "./ClaudeSessionAttachment.ts";
+import { projectClaudeLiveFrame } from "./claudeLiveProjection.ts";
 import * as Project from "./ProjectService.ts";
 import {
   attachmentEvent,
@@ -60,6 +61,7 @@ it.effect(
       files.set(rootPath, [rootLine]);
       files.set(childPath("child-one"), [reply("child-one")]);
       const source = Layer.mock(Source.ClaudeAttachmentSource)({
+        aliases: () => Effect.succeed([]),
         discover: () =>
           Effect.succeed({
             sessionId: "session",
@@ -186,6 +188,38 @@ it.effect(
           "messages",
         ])).messages,
       ).toHaveLength(1);
+      // A streamed block and its later JSONL record must remain one message.
+      const liveThread = yield* projection.getThread(attached.threadId);
+      const liveAt = yield* DateTime.now;
+      const liveEvents = projectClaudeLiveFrame({
+        thread: liveThread,
+        parent: null,
+        agentId: null,
+        epoch: "live-epoch",
+        at: liveAt,
+        messages: new Map(),
+        items: new Map(),
+        frame: {
+          sequence: 1,
+          type: "message",
+          payload: {
+            uuid: "live-reply",
+            door: "response",
+            origin: { kind: "model" },
+            step: { turnId: "live-turn", index: 0, blockIndex: 0 },
+            message: {
+              type: "assistant",
+              role: "assistant",
+              content: [{ type: "text", text: "Done" }],
+            },
+          },
+        },
+      });
+      yield* (yield* EventSink.EventSinkV2).write({ events: liveEvents });
+      const beforeLiveTranscript = yield* count();
+      files.get(rootPath)!.push(reply("live-reply"));
+      yield* first.sync;
+      expect(yield* count()).toEqual(beforeLiveTranscript);
       const before = yield* count();
       const restartedContext = yield* Layer.build(
         Layer.fresh(Attachment.layer).pipe(Layer.provide(deps)),
@@ -221,9 +255,11 @@ it.effect(
         }),
       ]);
       yield* restarted.sync;
-      expect((yield* projection.getThreadRecords(prior.id, ["messages"])).messages[0]?.role).toBe(
-        "system",
-      );
+      expect(
+        (yield* projection.getThreadRecords(prior.id, ["messages"])).messages.find(
+          (message) => message.id === `${prior.id}:prompt`,
+        )?.role,
+      ).toBe("system");
       expect((yield* projection.getThread(prior.id)).externalSession?.projectionVersion).toBe(4);
       yield* restarted.change({ action: "detach", threadId: attached.threadId });
       expect(

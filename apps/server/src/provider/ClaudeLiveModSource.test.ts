@@ -16,6 +16,7 @@ function harness(url = "http://127.0.0.1:12345/live", interactive = false) {
   let outgoing: (batch: Batch) => Data[] = () => [];
   let response: unknown = { behavior: "allow" };
   const requests: Data[] = [];
+  const aliases: Data[] = [];
   let tick: (() => Promise<void>) | undefined;
   let fail = false;
   let invalidAck = false;
@@ -41,12 +42,16 @@ function harness(url = "http://127.0.0.1:12345/live", interactive = false) {
       },
     },
     fs: {
+      write: async (_path: string, value: string) => {
+        aliases.push(JSON.parse(value));
+      },
       exists: async () => true,
       read: async () =>
         JSON.stringify({
           session: {
             url,
             token: "a".repeat(32),
+            aliasesDirectory: "/plugin/aliases",
             ...(interactive ? { waitCommand: ["fake-t3", "thread", "_bridge-request"] } : {}),
           },
         }),
@@ -112,6 +117,7 @@ function harness(url = "http://127.0.0.1:12345/live", interactive = false) {
     batches,
     calls,
     requests,
+    aliases,
     response: (value: unknown) => {
       response = value;
     },
@@ -349,4 +355,67 @@ it("recovers a dropped command result without submitting its prompt again", asyn
     id: "prompt",
     result: { text: "Exactly once", asUser: true },
   });
+});
+
+it("correlates queued T3 prompts with native transcript UUIDs without changing stored rows", async () => {
+  const h = harness();
+  await h.call("session.start", {});
+  h.commands((batch) => [
+    { id: "first", epoch: batch.epoch, type: "prompt", text: "Same text" },
+    { id: "second", epoch: batch.epoch, type: "prompt", text: "Same text" },
+  ]);
+  await h.flush();
+  h.commands(() => []);
+  const origin = { kind: "plugin", name: "t3-live-session", asUser: true };
+  for (const uuid of ["native-first", "native-second"]) {
+    const result = { uuid, message: { role: "user", content: "Same text" } };
+    expect(await h.call("session.append", { door: "prompt", origin }, async () => result)).toBe(
+      result,
+    );
+  }
+  await h.flush();
+  const messages = h.batches
+    .flatMap((batch) => batch.events)
+    .filter((event) => event.type === "message");
+  expect(messages.map((event) => [event.payload.commandId, event.payload.uuid])).toEqual([
+    ["first", "native-first"],
+    ["second", "native-second"],
+  ]);
+});
+
+it("flushes terminal events when the CLI exits between timer ticks", async () => {
+  const h = harness();
+  await h.call("session.start", {});
+  await h.flush();
+  await h.call("turn.complete", { turnId: "turn", reason: "answer" });
+  await h.call("session.end", { reason: "prompt_input_exit" });
+  expect(h.batches.at(-1)?.events.some((event) => event.type === "turn.complete")).toBe(true);
+  const count = h.batches.length;
+  await h.flush();
+  expect(h.batches).toHaveLength(count);
+});
+
+it("publishes a prompt identity before Claude exposes its transcript row", async () => {
+  const h = harness();
+  await h.call("session.start", {});
+  h.commands((batch) => [
+    { id: "t3-message", epoch: batch.epoch, type: "prompt", text: "Exact text" },
+  ]);
+  await h.flush();
+  const message = { type: "user", role: "user", content: [{ type: "text", text: "Exact text" }] };
+  await h.call(
+    "session.append",
+    {
+      uuid: "native-message",
+      door: "prompt",
+      message,
+      origin: { kind: "plugin", name: "t3-live-session", asUser: true },
+    },
+    async () => {
+      expect(h.aliases).toMatchObject([
+        { uuid: "native-message", commandId: "t3-message", role: "user", agentId: null },
+      ]);
+      return { uuid: "native-message", message };
+    },
+  );
 });

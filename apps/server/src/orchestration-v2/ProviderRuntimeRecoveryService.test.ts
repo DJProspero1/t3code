@@ -1451,3 +1451,52 @@ it.effect("leaves delegated tasks to their own child threads after process loss"
     assert.deepEqual(noted, [`subagent ${nativeSubagentId}`]);
   }).pipe(Effect.provide(layer));
 });
+
+it.effect.each(["startup", "shutdown"] as const)(
+  "preserves attached provider work and pending approvals during %s",
+  (trigger) => {
+    const threadId = ThreadId.make("external-live-thread");
+    const commit = vi.fn(() => Effect.die("External provider work must not be terminalized"));
+    const cancel = vi.fn(() => Effect.die("External provider effects must not be retired"));
+    const projection = {
+      thread: { id: threadId, externalSession: { attached: true } },
+      providerSessions: [{ id: ProviderSessionId.make("external-session"), status: "running" }],
+      runs: [{ id: RunId.make("external-run"), status: "running" }],
+      nodes: [{ id: NodeId.make("external-child"), status: "running" }],
+      runtimeRequests: [{ id: RuntimeRequestId.make("external-approval"), status: "pending" }],
+    } as unknown as OrchestrationV2ThreadProjection;
+    const layer = ProviderRuntimeRecovery.layer.pipe(
+      Layer.provide(ServerSettings.layerTest()),
+      Layer.provide(
+        Layer.mergeAll(
+          Layer.mock(ProjectionStore.ProjectionStoreV2)({
+            getRecoveryThreadIds: () => Effect.succeed([threadId]),
+            getRuntimeRecoveryProjection: () => Effect.succeed(projection),
+          }),
+          Layer.mock(EventSink.EventSinkV2)({ commitCommand: commit }),
+          IdAllocator.layer,
+          Layer.mock(EffectWorker.OrchestrationEffectWorkerV2)({
+            runRecoveryOnce: Effect.succeed(false),
+          }),
+          Layer.mock(EffectOutbox.EffectOutboxV2)({
+            reconcileAfterProcessLoss: Effect.succeed({ requeued: 0, cancelled: 0 }),
+            cancelUnsettled: cancel,
+          }),
+        ),
+      ),
+    );
+    return Effect.gen(function* () {
+      const recovery = yield* ProviderRuntimeRecovery.ProviderRuntimeRecoveryService;
+      const result = yield* recovery.reconcile(trigger);
+      assert.deepEqual(result, {
+        terminalizedRuns: 0,
+        stoppedSessions: 0,
+        closedRequests: 0,
+        retiredEffects: 0,
+        requeuedEffects: 0,
+      });
+      assert.equal(commit.mock.calls.length, 0);
+      assert.equal(cancel.mock.calls.length, 0);
+    }).pipe(Effect.provide(layer));
+  },
+);

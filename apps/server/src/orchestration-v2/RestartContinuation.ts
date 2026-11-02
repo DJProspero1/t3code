@@ -124,6 +124,8 @@ export function restartContinuationRun(
   >,
   now: DateTime.Utc,
 ): OrchestrationV2Run | undefined {
+  // Reconnecting an external process must never launch a replacement conversation.
+  if (projection.thread.externalSession?.attached) return undefined;
   const run = projection.runs.reduce<OrchestrationV2Run | undefined>(
     (latest, candidate) =>
       candidate.status !== "queued" &&

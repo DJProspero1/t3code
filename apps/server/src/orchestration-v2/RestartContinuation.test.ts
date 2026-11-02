@@ -1262,3 +1262,27 @@ it.effect.each(["completed", "failed", "interrupted"] as const)(
       );
     }),
 );
+
+it("never prepares a replacement run for an attached process", () => {
+  const projection = makeProjection();
+  assert.equal(
+    restartContinuationRun(
+      {
+        ...projection,
+        thread: {
+          ...projection.thread,
+          externalSession: {
+            provider: "claude",
+            sessionId: "native",
+            configDirectory: "/claude",
+            transcriptPath: "/claude/native.jsonl",
+            attached: true,
+            state: "unavailable",
+          },
+        },
+      },
+      now,
+    ),
+    undefined,
+  );
+});

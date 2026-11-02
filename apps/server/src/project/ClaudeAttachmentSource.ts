@@ -17,6 +17,18 @@ const Session = Schema.Struct({
   name: Schema.optional(Schema.String),
   status: Schema.optional(Schema.String),
 });
+const LiveAlias = Schema.Struct({
+  version: Schema.Literal(1),
+  epoch: Schema.String,
+  uuid: Schema.String,
+  role: Schema.Literals(["user", "assistant"]),
+  agentId: Schema.NullOr(Schema.String),
+  step: Schema.optional(
+    Schema.Struct({ turnId: Schema.String, index: Schema.Int, blockIndex: Schema.Int }),
+  ),
+  commandId: Schema.optional(Schema.String),
+});
+const decodeLiveAlias = Schema.decodeUnknownSync(Schema.fromJsonString(LiveAlias));
 const decodeSession = Schema.decodeUnknownSync(Schema.fromJsonString(Session));
 const uuid = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i;
 const agentFile = /^agent-([a-zA-Z0-9_-]+)\.jsonl$/;
@@ -44,6 +56,11 @@ export interface TranscriptCursor {
 export class ClaudeAttachmentSource extends Context.Service<
   ClaudeAttachmentSource,
   {
+    readonly aliases: (
+      home: string,
+      sessionId: string,
+      uuids: ReadonlyArray<string>,
+    ) => Effect.Effect<ReadonlyArray<typeof LiveAlias.Type>, ClaudeAttachmentSourceError>;
     readonly assertStopped: (
       home: string,
       sessionId: string,
@@ -126,6 +143,47 @@ export const layer = Layer.sync(ClaudeAttachmentSource, () => {
   >();
 
   return ClaudeAttachmentSource.of({
+    aliases: Effect.fn("ClaudeAttachmentSource.aliases")((home, sessionId, uuids) =>
+      Effect.tryPromise({
+        try: async () => {
+          if (!/^[a-zA-Z0-9_-]{1,128}$/.test(sessionId)) return [];
+          const expected = NodePath.join(home, "t3-live-session", "aliases", sessionId);
+          let root: string;
+          try {
+            root = await NodeFSP.realpath(expected);
+          } catch (cause) {
+            if ((cause as NodeJS.ErrnoException).code === "ENOENT") return [];
+            throw cause;
+          }
+          // Alias files contain identities only, never transcript content or credentials.
+          const result: Array<typeof LiveAlias.Type> = [];
+          for (let index = 0; index < uuids.length; index += 16) {
+            const rows = await Promise.all(
+              uuids.slice(index, index + 16).map(async (id) => {
+                if (!/^[a-zA-Z0-9_-]{1,128}$/.test(id)) return undefined;
+                let file: NodeFSP.FileHandle | undefined;
+                try {
+                  const actual = await NodeFSP.realpath(NodePath.join(root, `${id}.json`));
+                  if (NodePath.dirname(actual) !== root) throw new Error("Invalid live alias path");
+                  file = await NodeFSP.open(actual, "r");
+                  if ((await file.stat()).size > 4096) throw new Error("Oversized live alias");
+                  const alias = decodeLiveAlias(await file.readFile("utf8"));
+                  return alias.uuid === id ? alias : undefined;
+                } catch (cause) {
+                  if ((cause as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+                  throw cause;
+                } finally {
+                  await file?.close();
+                }
+              }),
+            );
+            for (const row of rows) if (row) result.push(row);
+          }
+          return result;
+        },
+        catch: (cause) => new ClaudeAttachmentSourceError({ operation: "read", cause }),
+      }),
+    ),
     assertStopped: Effect.fn("ClaudeAttachmentSource.assertStopped")(function* (home, sessionId) {
       const platform = yield* HostProcess.Platform;
       return yield* Effect.tryPromise({

@@ -122,3 +122,37 @@ it.effect("reads the current tail independently of a historical cursor", () =>
     expect((yield* source.tail(f.home, f.file)).lines.at(-1)).toBe("{}");
   }).pipe(Effect.provide(Source.layer)),
 );
+
+it.effect(
+  "reads bounded live identities without following alias files outside their directory",
+  () =>
+    Effect.gen(function* () {
+      const f = yield* fixture;
+      const source = yield* Source.ClaudeAttachmentSource;
+      expect(yield* source.aliases(f.home, f.sessionId, ["message"])).toEqual([]);
+      const dir = NodePath.join(f.home, "t3-live-session", "aliases", f.sessionId);
+      const alias = {
+        version: 1,
+        epoch: "epoch",
+        uuid: "message",
+        role: "assistant",
+        agentId: null,
+        step: { turnId: "turn", index: 0, blockIndex: 1 },
+      };
+      yield* Effect.promise(async () => {
+        await NodeFSP.mkdir(dir, { recursive: true });
+        await NodeFSP.writeFile(NodePath.join(dir, "message.json"), JSON.stringify(alias));
+        await NodeFSP.writeFile(NodePath.join(f.home, "outside.json"), JSON.stringify(alias));
+        await NodeFSP.symlink(
+          NodePath.join(f.home, "outside.json"),
+          NodePath.join(dir, "escape.json"),
+        );
+      });
+      expect(
+        yield* source.aliases(f.home, f.sessionId, ["message", "missing", "../outside"]),
+      ).toEqual([alias]);
+      expect(
+        (yield* source.aliases(f.home, f.sessionId, ["escape"]).pipe(Effect.flip)).operation,
+      ).toBe("read");
+    }).pipe(Effect.provide(Source.layer)),
+);

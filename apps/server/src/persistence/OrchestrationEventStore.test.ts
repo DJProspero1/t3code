@@ -283,6 +283,17 @@ layer("OrchestrationEventStore", (it) => {
         { prompt: event.payload.prompt, prompt_sequence: null },
         { prompt: "", prompt_sequence: appended[0]!.sequence },
       ]);
+      assert.deepEqual(yield* store.readAgentEventsById([]), []);
+      const byIds = yield* store.readAgentEventsById([
+        ...Array.from({ length: 510 }, (_, index) => EventId.make(`absent-live-event:${index}`)),
+        events[1]!.id,
+        events[0]!.id,
+        events[0]!.id,
+      ]);
+      assert.deepEqual(
+        new Map(byIds.map((row) => [row.event.id, row.event])),
+        new Map(events.map((event) => [event.id, event])),
+      );
       const replayed = yield* store.readAgentEvents({ threadId }).pipe(Stream.runCollect);
       assert.deepEqual(replayed, appended);
       const applicationEvents = yield* store

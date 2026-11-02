@@ -266,7 +266,7 @@ export function projectAttachmentLine(input: {
           ? block.is_error
             ? "failed"
             : "completed"
-          : previous?.completedAt
+          : previous?.completedAt || previous?.status === "running"
             ? previous.status
             : "idle",
         title: block.name ?? previous?.title ?? "External tool",

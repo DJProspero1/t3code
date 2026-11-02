@@ -10,17 +10,23 @@ let queuedBytes = 0;
 let sending = false;
 let timer;
 let lastContact = 0;
+let lastSnapshot = 0;
+let snapshotFingerprint;
+let snapshotting = false;
 const commands = new Map();
+const steps = new Map();
+const pendingPrompts = [];
 
 function record(type, payload) {
   if (!connection) return;
   try {
-    const event = { sequence: sequence + 1, type, payload };
+    const event = { sequence: sequence + 1, at: new Date().toISOString(), type, payload };
     const size = JSON.stringify(event).length;
     sequence = event.sequence;
     if (queuedBytes + size > 1024 * 1024) {
-      events = [{ sequence: ++sequence, type: 'resync', payload: {} }];
+      events = [{ sequence: ++sequence, at: event.at, type: 'resync', payload: {} }];
       queuedBytes = 64;
+      snapshotFingerprint = undefined;
       return;
     }
     events.push(event);
@@ -31,14 +37,24 @@ function record(type, payload) {
 }
 
 async function snapshot($) {
+  if (snapshotting) return;
+  snapshotting = true;
   try {
-    record('snapshot', {
+    const payload = {
       model: await $.session.model(),
       agents: await $.agent.list(),
       version: await $.session.version(),
-    });
+    };
+    const fingerprint = JSON.stringify(payload);
+    if (fingerprint !== snapshotFingerprint) {
+      record('snapshot', payload);
+      snapshotFingerprint = fingerprint;
+    }
+    lastSnapshot = Date.now();
   } catch {
     // Missing telemetry is not evidence that the session or its children stopped.
+  } finally {
+    snapshotting = false;
   }
 }
 
@@ -56,7 +72,18 @@ async function execute($, command) {
     switch (command.type) {
       case 'prompt':
         if (typeof command.text !== 'string') throw new Error('Invalid prompt');
-        result = await $.prompt.submit({ text: command.text, asUser: true });
+        pendingPrompts.push(command.id);
+        try {
+          result = await $.prompt.submit({ text: command.text, asUser: true });
+          if (result.drop !== undefined) {
+            const index = pendingPrompts.indexOf(command.id);
+            if (index >= 0) pendingPrompts.splice(index, 1);
+          }
+        } catch (error) {
+          const index = pendingPrompts.indexOf(command.id);
+          if (index >= 0) pendingPrompts.splice(index, 1);
+          throw error;
+        }
         break;
       case 'model':
         if (typeof command.model !== 'string') throw new Error('Invalid model');
@@ -88,7 +115,7 @@ async function execute($, command) {
 
 async function request($, kind, payload) {
   const requestId = crypto.randomUUID();
-  record('request.open', { requestId, kind, payload });
+  record('request.open', { requestId, kind, payload, agentId: payload.agentId ?? payload.agent_id });
   try {
     for (;;) {
       const result = await $.process.run(connection.waitCommand, {
@@ -103,7 +130,7 @@ async function request($, kind, payload) {
       return reply.response;
     }
   } finally {
-    record('request.closed', { requestId });
+    record('request.closed', { requestId, agentId: payload.agentId ?? payload.agent_id });
   }
 }
 
@@ -153,7 +180,7 @@ export function register(on) {
     if (url.protocol !== 'http:' || url.hostname !== '127.0.0.1' || url.username || url.password) return next(e);
     if (typeof configured.token !== 'string' || configured.token.length < 32) return next(e);
     const waitCommand = Array.isArray(configured.waitCommand) && configured.waitCommand.length > 0 && configured.waitCommand.every(arg => typeof arg === 'string') ? configured.waitCommand : undefined;
-    connection = { url: url.href, token: configured.token, waitCommand };
+    connection = { url: url.href, token: configured.token, waitCommand, aliasesDirectory: configured.aliasesDirectory };
     epoch = crypto.randomUUID();
     sequence = 0;
     acknowledged = 0;
@@ -161,7 +188,19 @@ export function register(on) {
     queuedBytes = 0;
     await snapshot($);
     if (timer) timer.cancel();
-    timer = $.clock.every(50, () => flush($));
+    timer = $.clock.every(50, () => {
+      if (Date.now() - lastSnapshot >= 2000) void snapshot($);
+      return flush($);
+    });
+    return next(e);
+  }).catch(($, e, next) => next(e));
+
+  on('session.end', async ($, e, next) => {
+    // The exiting CLI can otherwise discard the final step between timer ticks.
+    const until = Date.now() + 200;
+    while (sending && Date.now() < until) await $.clock.sleep(5);
+    await flush($);
+    if (timer) timer.cancel();
     return next(e);
   }).catch(($, e, next) => next(e));
 
@@ -171,10 +210,12 @@ export function register(on) {
   });
 
   on('turn.step', async function* ($, e, next) {
+    steps.set(e.agentId ?? '', { turnId: e.turnId, index: e.index });
     record('step.start', e);
     const stream = next(e);
     try {
       for await (const chunk of stream) {
+        if (Number.isInteger(chunk.index)) steps.set(e.agentId ?? '', { turnId: e.turnId, index: e.index, blockIndex: chunk.index });
         if (chunk.kind !== 'engine') record('step.chunk', { turnId: e.turnId, agentId: e.agentId, index: e.index, chunk });
         yield chunk;
       }
@@ -188,8 +229,24 @@ export function register(on) {
   });
 
   on('session.append', async ($, e, next) => {
+    const commandId = e.door === 'prompt' && e.origin?.kind === 'plugin' && e.origin.name === 't3-live-session' && e.origin.asUser === true
+      ? pendingPrompts.shift() : undefined;
+    const step = e.door === 'response' ? steps.get(e.agentId ?? '') : undefined;
+    // Publish the identity before Claude makes the JSONL row visible to its follower.
+    // This also survives a lost live batch or a server restart.
+    if (connection && typeof connection.aliasesDirectory === 'string' && /^[a-zA-Z0-9_-]{1,128}$/.test(e.uuid) && (step || commandId)) {
+      try {
+        await $.fs.write(connection.aliasesDirectory + '/' + e.uuid + '.json', JSON.stringify({
+          version: 1, epoch, uuid: e.uuid, role: e.message?.role ?? e.message?.type,
+          agentId: e.agentId ?? null, step, commandId,
+        }));
+      } catch {
+        // Failure to record observer metadata must not fail Claude's append.
+      }
+    }
     const result = await next(e);
-    record('message', { ...e, message: result.message, uuid: result.uuid });
+    if (result.message?.type !== undefined && !['user', 'assistant'].includes(result.message.type)) return result;
+    record('message', { ...e, message: result.message, uuid: result.uuid, commandId, step });
     return result;
   });
 
@@ -203,7 +260,7 @@ export function register(on) {
       } else {
         result = await next(e);
       }
-      record('tool.complete', { tool_use_id: e.tool_use_id, agentId: e.agentId });
+      record('tool.complete', { tool_use_id: e.tool_use_id, agentId: e.agentId, result });
       return result;
     } catch (error) {
       record('tool.failed', { tool_use_id: e.tool_use_id, agentId: e.agentId });
@@ -233,13 +290,16 @@ export function register(on) {
 
   on('turn.complete', async ($, e, next) => {
     record('turn.complete', e);
+    steps.delete(e.agentId ?? '');
     if (connection) await snapshot($);
     return next(e);
   });
 
   on('classic.SubagentStart', async ($, e, next) => {
     record('agent.start', e);
-    return next(e);
+    const result = await next(e);
+    if (connection) await snapshot($);
+    return result;
   });
 
   on('classic.SubagentStop', async ($, e, next) => {

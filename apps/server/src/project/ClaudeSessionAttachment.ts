@@ -27,6 +27,8 @@ import * as Semaphore from "effect/Semaphore";
 import * as SqlClient from "effect/sql/SqlClient";
 import { forkParked } from "../serverActivation.ts";
 import * as EventSink from "../orchestration-v2/EventSink.ts";
+import * as EventStore from "../orchestration-v2/EventStore.ts";
+import { claudeLiveMessageEventId, claudeLiveAliasMessageId } from "./claudeLiveProjection.ts";
 import * as ProjectionStore from "../orchestration-v2/ProjectionStore.ts";
 import * as ServerSettings from "../serverSettings.ts";
 import { mergeProviderInstanceEnvironment } from "@t3tools/provider-core/server/instanceEnvironment";
@@ -84,6 +86,7 @@ const decodeClaudeSettings = Schema.decodeUnknownEffect(ClaudeSettings);
 const make = Effect.gen(function* () {
   const source = yield* Source.ClaudeAttachmentSource;
   const sink = yield* EventSink.EventSinkV2;
+  const eventStore = yield* EventStore.EventStoreV2;
   const projections = yield* ProjectionStore.ProjectionStoreV2;
   const projects = yield* ProjectService.ProjectService;
   const sql = yield* SqlClient.SqlClient;
@@ -409,26 +412,73 @@ const make = Effect.gen(function* () {
           subagentIds: [attachmentNodeId(thread.id)],
         })).subagents[0]
       : undefined;
+    const detailsByLine = lines.map((line) => attachmentDetails(line, external.sessionId));
+    const aliases = new Map(
+      (yield* eventStore.readByIds(
+        detailsByLine.flatMap((details) =>
+          details?.uuid ? [claudeLiveMessageEventId(thread.id, details.uuid)] : [],
+        ),
+      )).flatMap((row) =>
+        row.event.type === "message.updated" ? [[row.event.id, row.event.payload.id] as const] : [],
+      ),
+    );
+    const journal = yield* source.aliases(
+      external.configDirectory,
+      external.sessionId,
+      detailsByLine.flatMap((details) =>
+        details?.uuid && !aliases.has(claudeLiveMessageEventId(thread.id, details.uuid))
+          ? [details.uuid]
+          : [],
+      ),
+    );
+    for (const alias of journal) {
+      if (alias.agentId !== agentId) continue;
+      const messageId = claudeLiveAliasMessageId(thread.id, alias.epoch, alias);
+      if (messageId) aliases.set(claudeLiveMessageEventId(thread.id, alias.uuid), messageId);
+    }
+    const candidateIds = [
+      ...new Set(
+        detailsByLine.flatMap((details) => {
+          if (!details?.uuid) return [];
+          const alias = aliases.get(claudeLiveMessageEventId(thread.id, details.uuid));
+          return [
+            ...(alias ? [alias] : []),
+            ...(details.isPeer
+              ? [MessageId.make(details.uuid), MessageId.make(`${thread.id}:${details.uuid}`)]
+              : []),
+          ];
+        }),
+      ),
+    ];
+    const messages = new Map(
+      (candidateIds.length === 0
+        ? []
+        : (yield* projections.getThreadRecords(thread.id, ["messages"], {
+            messageIds: candidateIds,
+          })).messages
+      ).map((message) => [message.id, message]),
+    );
     let ordinal = offset;
+    let lineIndex = 0;
     const tools = new Map<string, OrchestrationV2TurnItem>();
     const events = (yield* Effect.forEach(
       lines,
       Effect.fnUntraced(function* (line) {
         ordinal += Buffer.byteLength(line) + 1;
-        const details = attachmentDetails(line, external.sessionId);
+        const details = detailsByLine[lineIndex++];
         const offsets = liveRecords.get(thread.id)?.offsets;
         if (details?.uuid) {
           if (live) offsets?.set(details.uuid, ordinal);
           else if ((offsets?.get(details.uuid) ?? -1) > ordinal) return [];
         }
-        const existingMessage =
-          details?.isPeer && details.uuid
-            ? (yield* projections.getThreadRecords(thread.id, ["messages"], {
-                messageIds: [
-                  MessageId.make(details.uuid),
-                  MessageId.make(`${thread.id}:${details.uuid}`),
-                ],
-              })).messages[0]
+        const alias = details?.uuid
+          ? aliases.get(claudeLiveMessageEventId(thread.id, details.uuid))
+          : undefined;
+        const existingMessage = alias
+          ? messages.get(alias)
+          : details?.isPeer && details.uuid
+            ? (messages.get(MessageId.make(details.uuid)) ??
+              messages.get(MessageId.make(`${thread.id}:${details.uuid}`)))
             : undefined;
         for (const toolId of details?.toolIds ?? []) {
           if (tools.has(toolId)) continue;
@@ -440,6 +490,7 @@ const make = Effect.gen(function* () {
         }
         const projected = projectAttachmentLine({
           previousTools: tools,
+          ...(alias ? { messageId: alias } : {}),
           sentMessage: existingMessage?.creationSource !== "provider" ? existingMessage : undefined,
           thread,
           parent,

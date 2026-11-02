@@ -203,6 +203,11 @@ export const make = Effect.gen(function* () {
       continueAfterRestart: boolean,
       stoppedThisPass: ReadonlyMap<string, RecoverySession> = new Map(),
     ) {
+      // An attached provider owns its process and callbacks. A T3 restart says
+      // nothing about whether its root, children, or approvals have finished.
+      if (projection.thread.externalSession?.attached) {
+        return { terminalizedRuns: 0, stoppedSessions: 0, closedRequests: 0, retiredEffects: 0 };
+      }
       const now = yield* DateTime.now;
       const runs = [] as Array<OrchestrationV2ThreadProjection["runs"][number]>;
       for (const run of nonterminalRuns(projection)) {
@@ -757,7 +762,11 @@ export const make = Effect.gen(function* () {
           .continueThreadsAfterServerUpdate;
       const result = yield* reconcileProjection(projection, trigger, enabled, stoppedThisPass);
       for (const session of projection.providerSessions) {
-        if (session.status !== "stopped" && session.status !== "error") {
+        if (
+          !projection.thread.externalSession?.attached &&
+          session.status !== "stopped" &&
+          session.status !== "error"
+        ) {
           stoppedThisPass.set(session.id, session);
         }
       }

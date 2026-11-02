@@ -2797,7 +2797,7 @@ function classifyClaudeNativeTool(toolName: string): ClaudeToolClassification {
       };
 }
 
-function providerRequestKindFromClaudeTool(toolName: string): ProviderRequestKind {
+export function providerRequestKindFromClaudeTool(toolName: string): ProviderRequestKind {
   return classifyClaudeNativeTool(toolName).requestKind;
 }
 
