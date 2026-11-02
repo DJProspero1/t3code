@@ -1,4 +1,8 @@
-import { canMutateExternalSession, projectExternalMessage } from "./externalSessionPolicy.ts";
+import {
+  canMutateExternalSession,
+  isUnchangedExternalSessionSetting,
+  projectExternalMessage,
+} from "./externalSessionPolicy.ts";
 import type {
   GuestShareId,
   OrchestrationV2SearchThreadInput,
@@ -13004,8 +13008,10 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           (cause) => new OrchestratorProjectionError({ threadId: commandThreadId(command), cause }),
         ),
       );
-      if (target?.externalSession)
+      if (target?.externalSession) {
+        if (isUnchangedExternalSessionSetting(command, target)) return { events: [], effects: [] };
         return yield* new ExternalSessionReadOnlyError({ threadId: target.id });
+      }
     }
 
     const events = yield* Ref.make<Array<OrchestrationV2DomainEvent>>([]);
@@ -13548,6 +13554,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           command.type === "thread.interrupt.unresponsive" ||
           command.type === "thread.stop" ||
           command.type === "subagent.stop" ||
+          command.type === "thread.runtime-mode.set" ||
+          command.type === "thread.interaction-mode.set" ||
+          command.type === "thread.model-selection.set" ||
           // Closing a share again, or after it ended, is not an error.
           command.type === "thread.guest-share.close" ||
           (command.type === "thread.delete" && command.onlyIfUnused === true),

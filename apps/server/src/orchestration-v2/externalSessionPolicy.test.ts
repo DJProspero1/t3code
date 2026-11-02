@@ -86,6 +86,34 @@ it.effect("queues a prompt for the existing Claude inbox without creating a prov
         },
       ],
     });
+    for (const setting of [
+      { type: "thread.runtime-mode.set", runtimeMode: "approval-required" },
+      { type: "thread.interaction-mode.set", interactionMode: "default" },
+      { type: "thread.model-selection.set", modelSelection },
+    ] as const) {
+      yield* orchestrator.dispatch({
+        ...setting,
+        commandId: CommandId.make(`unchanged:${setting.type}`),
+        threadId,
+      });
+    }
+    for (const setting of [
+      { type: "thread.runtime-mode.set", runtimeMode: "full-access" },
+      { type: "thread.interaction-mode.set", interactionMode: "plan" },
+      {
+        type: "thread.model-selection.set",
+        modelSelection: { ...modelSelection, model: "different-model" },
+      },
+    ] as const) {
+      const error = yield* orchestrator
+        .dispatch({
+          ...setting,
+          commandId: CommandId.make(`changed:${setting.type}`),
+          threadId,
+        })
+        .pipe(Effect.flip);
+      expect(error._tag).toBe("ExternalSessionReadOnlyError");
+    }
     const denied = yield* orchestrator
       .dispatch({
         type: "message.dispatch",

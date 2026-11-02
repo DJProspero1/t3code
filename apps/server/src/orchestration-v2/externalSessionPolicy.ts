@@ -3,7 +3,9 @@ import {
   TurnItemId,
   type OrchestrationV2ServerCommand,
   type OrchestrationV2DomainEvent,
+  type OrchestrationV2AppThread,
 } from "@t3tools/contracts";
+import { modelSelectionsEqual } from "@t3tools/shared/model";
 import * as DateTime from "effect/DateTime";
 
 const observerCommands = new Set<OrchestrationV2ServerCommand["type"]>([
@@ -23,6 +25,22 @@ const observerCommands = new Set<OrchestrationV2ServerCommand["type"]>([
 
 export const canMutateExternalSession = (type: OrchestrationV2ServerCommand["type"]) =>
   observerCommands.has(type);
+
+export function isUnchangedExternalSessionSetting(
+  command: OrchestrationV2ServerCommand,
+  thread: OrchestrationV2AppThread,
+): boolean {
+  switch (command.type) {
+    case "thread.runtime-mode.set":
+      return command.runtimeMode === thread.runtimeMode;
+    case "thread.interaction-mode.set":
+      return command.interactionMode === thread.interactionMode;
+    case "thread.model-selection.set":
+      return modelSelectionsEqual(command.modelSelection, thread.modelSelection);
+    default:
+      return false;
+  }
+}
 
 export function projectExternalMessage(
   command: Extract<OrchestrationV2ServerCommand, { type: "message.dispatch" }>,
