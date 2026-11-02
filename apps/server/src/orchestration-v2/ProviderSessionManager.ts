@@ -218,6 +218,7 @@ export class ProviderSessionManagerV2 extends Context.Service<
 >()("t3/orchestration-v2/ProviderSessionManager/ProviderSessionManagerV2") {}
 
 interface LiveSessionEntry {
+  readonly nativeAttachment: string | undefined;
   readonly attachedThreadIds: ReadonlySet<ThreadId>;
   readonly loadedProviderThreadKeyByThread: ReadonlyMap<ThreadId, string>;
   /** Scope revocation to recorded credential ids so superseded sessions cannot revoke replacements opened before detach. */
@@ -2145,7 +2146,8 @@ export const layerWithOptions = (
               if (existing !== undefined) {
                 if (
                   input.attachToNativeThread !== undefined &&
-                  existing.runtime.processOwnership !== "external"
+                  (existing.runtime.processOwnership !== "external" ||
+                    existing.nativeAttachment !== input.attachToNativeThread)
                 )
                   return yield* new ProviderSessionOpenError({
                     instanceId: input.modelSelection.instanceId,
@@ -2265,6 +2267,7 @@ export const layerWithOptions = (
               >(new Map());
               const exposedRuntime = decorateRuntime(runtime, eventSubscribers);
               const entry: LiveSessionEntry = {
+                nativeAttachment,
                 attachedThreadIds: new Set([input.threadId]),
                 loadedProviderThreadKeyByThread: new Map(),
                 mcpCredentialIdByThread:

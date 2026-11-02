@@ -8655,3 +8655,126 @@ describe("codexDynamicToolOutput", () => {
     ]);
   });
 });
+
+describe("CodexAdapterV2 native attachment", () => {
+  it.effect.each([true, false])(
+    "attaches only an already-loaded conversation (loaded: %s)",
+    (loaded) =>
+      Effect.gen(function* () {
+        const nativeThreadId = "external-native";
+        const incoming = yield* Queue.unbounded<Uint8Array, Cause.Done>();
+        const requests: Array<{ method: string; params?: unknown }> = [];
+        const preamble = codexReplayPreamble({
+          nativeThreadId,
+          nativeTurnId: "native-turn",
+          prompt: "unused",
+        });
+        const client = yield* CodexClient.make(
+          Stdio.make({
+            args: Effect.succeed([]),
+            stdin: Stream.fromQueue(incoming),
+            stdout: () =>
+              Sink.forEach((chunk: string | Uint8Array) =>
+                Effect.gen(function* () {
+                  const frame = JSON.parse(
+                    typeof chunk === "string" ? chunk : new TextDecoder().decode(chunk),
+                  );
+                  requests.push(frame);
+                  if (frame.id === undefined) return;
+                  const template = preamble.find(
+                    (entry) =>
+                      entry.type === "emit_inbound" &&
+                      entry.label ===
+                        (frame.method === "thread/resume" ? "thread/start" : frame.method),
+                  );
+                  const result =
+                    frame.method === "thread/loaded/list"
+                      ? { data: loaded ? [nativeThreadId] : [], nextCursor: null }
+                      : template?.type === "emit_inbound" && Predicate.isObject(template.frame)
+                        ? template.frame.result
+                        : undefined;
+                  assert.isDefined(result, `unexpected native request ${frame.method}`);
+                  yield* Queue.offer(
+                    incoming,
+                    new TextEncoder().encode(JSON.stringify({ id: frame.id, result }) + "\n"),
+                  );
+                }),
+              ),
+            stderr: () => Sink.drain,
+          }),
+          {},
+        );
+        const opened: Array<string | undefined> = [];
+        const adapter = yield* CodexAdapterV2.makeCodexAdapterV2({
+          instanceId: CodexAdapterV2.CODEX_DEFAULT_INSTANCE_ID,
+          settings: DEFAULT_CODEX_SETTINGS,
+          nativeDaemonSocketPath: "/source-home/app-server-control/app-server-control.sock",
+          environment: {},
+          resolveRuntime: Effect.die("Attachment must not install or launch a managed runtime"),
+          clientFactory: {
+            open: (input) =>
+              Effect.sync(() => {
+                opened.push(input.daemonSocketPath);
+                return client;
+              }),
+          },
+          crypto: yield* Crypto.Crypto,
+          fileSystem: yield* FileSystem.FileSystem,
+          idAllocator: yield* IdAllocator.IdAllocatorV2,
+          serverConfig: yield* ProviderReplayHarness.makeReplayServerConfig(
+            "native-attachment",
+          ).pipe(Effect.orDie),
+        });
+        assert.isDefined(adapter.attachSession);
+        const input = {
+          threadId: ThreadId.make("attached-app-thread"),
+          providerSessionId: ProviderSessionId.make("attached-provider-session"),
+          nativeThreadId,
+          modelSelection: CODEX_TEST_MODEL_SELECTION,
+          runtimePolicy: CODEX_TEST_RUNTIME_POLICY,
+        };
+        const attachment = yield* adapter.attachSession!(input).pipe(Effect.exit);
+        assert.deepEqual(opened, ["/source-home/app-server-control/app-server-control.sock"]);
+        if (!loaded) {
+          assert.isTrue(Exit.isFailure(attachment));
+          assert.deepEqual(
+            requests.map((request) => request.method),
+            ["initialize", "initialized", "thread/loaded/list"],
+          );
+          return;
+        }
+        assert.isTrue(Exit.isSuccess(attachment));
+        if (!Exit.isSuccess(attachment)) return;
+        const runtime = attachment.value;
+        assert.strictEqual(runtime.processOwnership, "external");
+        const providerThread = yield* runtime.ensureThread(input);
+        assert.strictEqual(providerThread.nativeThreadRef?.nativeId, nativeThreadId);
+        yield* runtime.resumeThread({
+          providerThread,
+          modelSelection: CODEX_TEST_MODEL_SELECTION,
+          runtimePolicy: CODEX_TEST_RUNTIME_POLICY,
+        });
+        assert.deepEqual(
+          requests
+            .filter((request) => request.method === "thread/resume")
+            .map((request) => request.params),
+          [
+            { threadId: nativeThreadId, excludeTurns: true },
+            { threadId: nativeThreadId, excludeTurns: true },
+          ],
+        );
+        assert.isFalse(
+          requests.some((request) =>
+            ["thread/start", "thread/unarchive", "turn/start", "turn/interrupt"].includes(
+              request.method,
+            ),
+          ),
+        );
+      }).pipe(
+        Effect.scoped,
+        Effect.provide(
+          Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+        ),
+      ),
+  );
+});

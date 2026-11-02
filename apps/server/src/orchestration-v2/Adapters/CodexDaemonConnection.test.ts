@@ -9,6 +9,7 @@ import {
   ProviderEventLoggers,
 } from "@t3tools/provider-core/server/ProviderEventLoggers";
 import * as Effect from "effect/Effect";
+import * as HostProcess from "@t3tools/shared/HostProcess";
 import * as Exit from "effect/Exit";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
@@ -19,7 +20,7 @@ import { CodexAppServerClientFactory, layerAppServerClientFactory } from "./Code
 
 const decodeSettings = Schema.decodeEffect(CodexSettings);
 
-it.effect(
+it.effect.skipIf(HostProcess.Platform.defaultValue() === "win32")(
   "connects to the existing Unix daemon without spawning it and leaves it alive on detach",
   () =>
     Effect.gen(function* () {

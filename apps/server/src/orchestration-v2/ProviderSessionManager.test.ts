@@ -359,7 +359,7 @@ const makeProviderAdapter = Effect.fnUntraced(function* (
       : Deferred.succeed(options.scopeCloseReached, undefined)
     ).pipe(Effect.andThen(Effect.never)),
   );
-  return ProviderAdapter.ProviderAdapterV2.of({
+  const adapter = ProviderAdapter.ProviderAdapterV2.of({
     instanceId: ProviderInstanceId.make("codex"),
     driver: CODEX_DRIVER,
     getCapabilities: () => Effect.succeed(options.capabilities ?? CodexCapabilities),
@@ -462,6 +462,15 @@ const makeProviderAdapter = Effect.fnUntraced(function* (
         } satisfies ProviderAdapter.ProviderAdapterV2SessionRuntime;
       }),
   });
+  return options.externallyOwned
+    ? ProviderAdapter.ProviderAdapterV2.of({
+        ...adapter,
+        attachSession: (input) =>
+          adapter
+            .openSession(input)
+            .pipe(Effect.map((runtime) => ({ ...runtime, processOwnership: "external" as const }))),
+      })
+    : adapter;
 });
 
 function layerTest(input: {
@@ -3863,4 +3872,41 @@ it.effect(
       });
       yield* effect.pipe(Effect.provide(layerTest({ state, idleTimeoutMs: 1000 })));
     }),
+);
+
+it.effect("ProviderSessionManagerV2 refuses reuse for another native attachment", () =>
+  Effect.gen(function* () {
+    const state = yield* Ref.make(emptyState);
+    yield* Effect.gen(function* () {
+      const manager = yield* ProviderSessionManager.ProviderSessionManagerV2;
+      const sink = yield* EventSink.EventSinkV2;
+      const idAllocator = yield* IdAllocator.IdAllocatorV2;
+      const threadId = ThreadId.make("external-identity");
+      const providerSessionId = yield* idAllocator.allocate.providerSession({
+        providerInstanceId: modelSelection.instanceId,
+        threadId,
+      });
+      yield* sink.write({
+        events: [
+          yield* makeThreadCreatedEvent({ idAllocator, threadId, now: yield* DateTime.now }),
+        ],
+      });
+      const input = {
+        threadId,
+        providerSessionId,
+        modelSelection,
+        runtimePolicy,
+        attachToNativeThread: "native-one",
+      };
+      const first = yield* manager.open(input);
+      assert.strictEqual(yield* manager.open(input), first);
+      const other = yield* manager
+        .open({ ...input, attachToNativeThread: "native-two" })
+        .pipe(Effect.exit);
+      assert.isTrue(Exit.isFailure(other));
+      assert.strictEqual(Option.getOrThrow(yield* manager.get(providerSessionId)), first);
+      assert.equal((yield* Ref.get(state)).openCount, 1);
+      assert.equal((yield* Ref.get(state)).interruptCount, 0);
+    }).pipe(Effect.provide(layerTest({ state, idleTimeoutMs: 1000, externallyOwned: true })));
+  }),
 );
