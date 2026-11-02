@@ -285,3 +285,30 @@ describe("external Claude projection", () => {
     expect(project({ ...record, timestamp: "invalid" })).toEqual([]);
   });
 });
+
+it("preserves explicitly human plugin prompts while keeping ordinary plugin traffic internal", () => {
+  for (const [origin, role] of [
+    [{ kind: "plugin", name: "t3-live-session", asUser: true }, "user"],
+    [{ kind: "plugin", name: "t3-live-session", asUser: false }, "system"],
+    [{ kind: "plugin", name: "another-plugin" }, "system"],
+    [{ kind: "peer", asUser: true }, "system"],
+  ] as const) {
+    const events = projectAttachmentLine({
+      thread,
+      parent: null,
+      agentId: null,
+      ordinal: 1,
+      line: JSON.stringify({
+        ...record,
+        type: "user",
+        origin,
+        message: { content: [{ type: "text", text: "My exact message" }] },
+      }),
+    });
+    expect(events.find((event) => event.type === "message.updated")?.payload).toMatchObject({
+      role,
+      text: "My exact message",
+    });
+    for (const event of events) expect(isEvent(event)).toBe(true);
+  }
+});

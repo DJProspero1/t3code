@@ -27,7 +27,9 @@ const Record = Schema.Struct({
   isCompactSummary: Schema.optional(Schema.Boolean),
   isVisibleInTranscriptOnly: Schema.optional(Schema.Boolean),
   promptSource: Schema.optional(Schema.String),
-  origin: Schema.optional(Schema.Struct({ kind: Schema.String })),
+  origin: Schema.optional(
+    Schema.Struct({ kind: Schema.String, asUser: Schema.optional(Schema.Boolean) }),
+  ),
   toolUseResult: Schema.optional(Schema.Unknown),
   message: Schema.optional(
     Schema.Struct({
@@ -154,7 +156,9 @@ export function projectAttachmentLine(input: {
       record.isCompactSummary ||
       record.isVisibleInTranscriptOnly ||
       record.promptSource === "system" ||
-      (record.origin !== undefined && record.origin.kind !== "human") ||
+      (record.origin !== undefined &&
+        record.origin.kind !== "human" &&
+        !(record.origin.kind === "plugin" && record.origin.asUser === true)) ||
       (record.origin === undefined &&
         /^(?:<task-notification>|<command-name>|<local-command-|\[Request interrupted by user)/.test(
           text,

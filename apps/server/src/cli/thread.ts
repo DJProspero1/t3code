@@ -26,12 +26,14 @@ import * as Schema from "effect/Schema";
 import * as Stdio from "effect/Stdio";
 import * as Stream from "effect/Stream";
 import { Argument, Command, Flag, GlobalFlag } from "effect/cli";
+import { FetchHttpClient } from "effect/http";
 
 import * as EnvironmentAuth from "../auth/EnvironmentAuth.ts";
 import * as ServerConfig from "../config.ts";
 import { mcpToolSession, type McpToolSession } from "../mcp/AcpMcpStdioBridge.ts";
 import { readPersistedServerRuntimeState } from "../serverRuntimeState.ts";
 import { projectLocationFlags, resolveCliAuthConfig } from "./config.ts";
+import * as ClaudeLiveRequestWaiter from "../provider/ClaudeLiveRequestWaiter.ts";
 
 /**
  * Short enough that a run which stops to ask the user something is noticed
@@ -849,12 +851,39 @@ const threadHandoffCommand = Command.make("handoff", {
   ),
 );
 
+const decodeClaudeLiveRequest = Schema.decodeUnknownEffect(
+  Schema.fromJsonString(ClaudeLiveRequestWaiter.ClaudeLiveRequest),
+);
+const threadBridgeRequestCommand = Command.make("_bridge-request").pipe(
+  Command.withDescription(
+    "Internal Claude approval transport; reads its authenticated request from stdin.",
+  ),
+  Command.withHandler(() =>
+    Effect.gen(function* () {
+      const stdio = yield* Stdio.Stdio;
+      const input = yield* stdio.stdin.pipe(Stream.decodeText(), Stream.mkString);
+      const request = yield* decodeClaudeLiveRequest(input).pipe(
+        Effect.mapError(
+          () => new ClaudeLiveRequestWaiter.ClaudeLiveRequestError({ reason: "invalid-response" }),
+        ),
+      );
+      const waiter = yield* ClaudeLiveRequestWaiter.ClaudeLiveRequestWaiter;
+      yield* Console.log(
+        yield* ClaudeLiveRequestWaiter.encodeResponse(yield* waiter.wait(request)),
+      );
+    }).pipe(
+      Effect.provide(ClaudeLiveRequestWaiter.layer.pipe(Layer.provide(FetchHttpClient.layer))),
+    ),
+  ),
+);
+
 export const threadCommand = Command.make("thread").pipe(
   Command.withDescription("Start, message, and read threads on the running server."),
   Command.withSubcommands([
     threadAttachCommand,
     threadDetachCommand,
     threadHandoffCommand,
+    threadBridgeRequestCommand,
     threadListCommand,
     threadStartCommand,
     threadSendCommand,
