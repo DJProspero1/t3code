@@ -1,4 +1,6 @@
 import {
+  ClaudeSettings,
+  resolveProviderInstanceEnabled,
   DEFAULT_MODEL_BY_PROVIDER,
   DEFAULT_MODEL,
   ProviderDriverKind,
@@ -6,6 +8,8 @@ import {
   ProviderThreadId,
   ThreadId,
   MessageId,
+  TurnItemId,
+  type OrchestrationV2TurnItem,
   type OrchestrationV2ProviderThread,
   type OrchestrationV2Subagent,
   type ClaudeSessionAttachmentInput,
@@ -18,13 +22,15 @@ import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
-import * as Schedule from "effect/Schedule";
 import * as Schema from "effect/Schema";
 import * as Semaphore from "effect/Semaphore";
 import * as SqlClient from "effect/sql/SqlClient";
 import { forkParked } from "../serverActivation.ts";
 import * as EventSink from "../orchestration-v2/EventSink.ts";
 import * as ProjectionStore from "../orchestration-v2/ProjectionStore.ts";
+import * as ServerSettings from "../serverSettings.ts";
+import { mergeProviderInstanceEnvironment } from "@t3tools/provider-core/server/instanceEnvironment";
+import { resolveClaudeHomePath } from "../provider/Drivers/ClaudeHome.ts";
 import * as ProjectService from "./ProjectService.ts";
 import * as Source from "./ClaudeAttachmentSource.ts";
 import {
@@ -37,9 +43,16 @@ import {
 
 export class ClaudeSessionAttachmentError extends Schema.TaggedError<ClaudeSessionAttachmentError>()(
   "ClaudeSessionAttachmentError",
-  { cause: Schema.Defect() },
+  {
+    cause: Schema.Defect(),
+    reason: Schema.optional(Schema.Literals(["unsupported-provider", "unavailable-instance"])),
+  },
 ) {
   override get message() {
+    if (this.reason === "unsupported-provider")
+      return "Live attachment is not implemented for this provider. The existing session was not changed.";
+    if (this.reason === "unavailable-instance")
+      return "Select an enabled provider instance configured in this T3 environment.";
     return "Could not attach the Claude session. Use its exact live name or session ID and an existing T3 project. The Claude process was not changed.";
   }
 }
@@ -58,22 +71,29 @@ export class ClaudeSessionAttachment extends Context.Service<
   }
 >()("t3/project/ClaudeSessionAttachment") {}
 
+const isAttachmentError = Schema.is(ClaudeSessionAttachmentError);
+
+const decodeClaudeSettings = Schema.decodeUnknownEffect(ClaudeSettings);
+
 const make = Effect.gen(function* () {
   const source = yield* Source.ClaudeAttachmentSource;
   const sink = yield* EventSink.EventSinkV2;
   const projections = yield* ProjectionStore.ProjectionStoreV2;
   const projects = yield* ProjectService.ProjectService;
   const sql = yield* SqlClient.SqlClient;
-  const home = yield* HostProcess.HomeDirectory;
   const environment = yield* HostProcess.Environment;
+  const home = yield* HostProcess.HomeDirectory;
+  const platform = yield* HostProcess.Platform;
   const path = yield* Path.Path;
-  const configDirectory = path.resolve(environment.CLAUDE_CONFIG_DIR ?? path.join(home, ".claude"));
+  const settings = yield* ServerSettings.ServerSettingsService;
   const gate = yield* Semaphore.make(1);
-  const providerInstanceId = ProviderInstanceId.make("claudeAgent");
+  const syncedFiles = new Map<string, string>();
 
   const create = Effect.fn("ClaudeSessionAttachment.create")(function* (
     parent: OrchestrationV2AppThread | null,
     data: {
+      configDirectory: string;
+      providerInstanceId: ProviderInstanceId;
       sessionId: string;
       transcriptPath: string;
       title: string;
@@ -83,11 +103,13 @@ const make = Effect.gen(function* () {
       model?: string;
     },
   ) {
+    const { configDirectory, providerInstanceId } = data;
     const threadId = attachmentThreadId(configDirectory, data.sessionId, data.agentId);
     const existing = yield* projections.getThread(threadId).pipe(Effect.option);
     if (Option.isSome(existing)) {
       if (
         existing.value.projectId !== data.projectId ||
+        existing.value.providerInstanceId !== providerInstanceId ||
         !existing.value.externalSession ||
         existing.value.deletedAt !== null
       ) {
@@ -111,6 +133,7 @@ const make = Effect.gen(function* () {
         }
         if (ancestor)
           return yield* new ClaudeSessionAttachmentError({ cause: "Subagent ancestry too deep" });
+        syncedFiles.delete(threadId);
         const now = yield* DateTime.now;
         const updated = {
           ...existing.value,
@@ -125,7 +148,8 @@ const make = Effect.gen(function* () {
             nodeIds: [attachmentNodeId(threadId)],
           },
         );
-        yield* sink.write({
+        const committed = yield* sink.write({
+          expectedThread: existing.value,
           skipExistingEventIds: true,
           events: [
             ...related.subagents.map((item) =>
@@ -163,7 +187,7 @@ const make = Effect.gen(function* () {
             ),
           ],
         });
-        return updated;
+        return committed.length ? updated : yield* projections.getThread(threadId);
       }
       return existing.value;
     }
@@ -193,7 +217,7 @@ const make = Effect.gen(function* () {
         configDirectory,
         transcriptPath: data.transcriptPath,
         attached: true,
-        projectionVersion: 2,
+        projectionVersion: 3,
         state: "connecting",
       },
       lineage: {
@@ -261,21 +285,24 @@ const make = Effect.gen(function* () {
     cursor?: Source.TranscriptCursor,
     model?: string,
   ) {
+    if (state === "connecting" || state === "detached") syncedFiles.delete(threadId);
     const thread = yield* projections.getThread(threadId);
     const externalSession = thread.externalSession;
     if (
       !externalSession ||
       thread.deletedAt !== null ||
+      (!externalSession.attached && state !== "connecting" && state !== "detached") ||
       (externalSession.state === state &&
         (!cursor ||
-          (externalSession.projectionVersion === 2 &&
+          (externalSession.projectionVersion === 3 &&
             cursor.offset === externalSession.cursor?.offset &&
             cursor.identity === externalSession.cursor?.identity)) &&
         (!model || model === thread.modelSelection.model))
     )
       return;
     const now = yield* DateTime.now;
-    yield* sink.write({
+    const committed = yield* sink.write({
+      expectedThread: thread,
       skipExistingEventIds: true,
       events: [
         attachmentEvent(
@@ -288,15 +315,19 @@ const make = Effect.gen(function* () {
               ...externalSession,
               attached: state !== "detached",
               state,
-              ...(cursor ? { cursor, projectionVersion: 2 } : {}),
+              ...(cursor ? { cursor, projectionVersion: 3 } : {}),
             },
             updatedAt: now,
           },
           now,
-          `${state}:${externalSession.state}:${externalSession.projectionVersion ?? 0}:2:${cursor?.identity ?? ""}:${cursor?.offset ?? -1}:${model ?? ""}:${DateTime.toEpochMillis(now)}`,
+          `${state}:${externalSession.state}:${externalSession.projectionVersion ?? 0}:3:${cursor?.identity ?? ""}:${cursor?.offset ?? -1}:${model ?? ""}:${DateTime.toEpochMillis(now)}`,
         ),
       ],
     });
+    if (!committed.length)
+      return yield* new ClaudeSessionAttachmentError({
+        cause: "Thread changed during attachment update; retry",
+      });
   });
 
   const followFile = Effect.fn("ClaudeSessionAttachment.followFile")(function* (
@@ -306,7 +337,7 @@ const make = Effect.gen(function* () {
   ) {
     const external = thread.externalSession!;
     const old =
-      external.projectionVersion === 2 ? (external.cursor ?? { offset: 0 }) : { offset: 0 };
+      external.projectionVersion === 3 ? (external.cursor ?? { offset: 0 }) : { offset: 0 };
     const read = yield* source.read(external.configDirectory, external.transcriptPath, old);
     let model: string | undefined;
     for (const line of read.lines) {
@@ -316,6 +347,8 @@ const make = Effect.gen(function* () {
         const root = parent ?? thread;
         yield* create(thread, {
           projectId: thread.projectId,
+          configDirectory: external.configDirectory,
+          providerInstanceId: thread.providerInstanceId,
           sessionId: external.sessionId,
           agentId: details.spawn.agentId,
           transcriptPath: path.join(
@@ -335,6 +368,7 @@ const make = Effect.gen(function* () {
         })).subagents[0]
       : undefined;
     let ordinal = old.offset;
+    const tools = new Map<string, OrchestrationV2TurnItem>();
     const events = (yield* Effect.forEach(
       read.lines,
       Effect.fnUntraced(function* (line) {
@@ -349,7 +383,16 @@ const make = Effect.gen(function* () {
                 ],
               })).messages[0]
             : undefined;
+        for (const toolId of details?.toolResults ?? []) {
+          if (tools.has(toolId)) continue;
+          const previous = yield* projections.getTurnItem({
+            threadId: thread.id,
+            itemId: TurnItemId.make(`${thread.id}:tool:${toolId}`),
+          });
+          if (previous) tools.set(toolId, previous);
+        }
         const projected = projectAttachmentLine({
+          previousTools: tools,
           sentMessage: existingMessage?.creationSource !== "provider" ? existingMessage : undefined,
           thread,
           parent,
@@ -359,6 +402,14 @@ const make = Effect.gen(function* () {
           previousSubagent,
           includeActivity: false,
         });
+        for (const event of projected) {
+          if (
+            event.type === "turn-item.updated" &&
+            event.payload.type === "dynamic_tool" &&
+            event.payload.nativeItemRef?.nativeId
+          )
+            tools.set(event.payload.nativeItemRef.nativeId, event.payload);
+        }
         const child = projected.find((event) => event.type === "subagent.updated");
         if (child?.type === "subagent.updated") previousSubagent = child.payload;
         return projected;
@@ -371,20 +422,23 @@ const make = Effect.gen(function* () {
   });
 
   const activitySnapshots = new Map<string, string>();
+  type Tail = { lines: ReadonlyArray<string>; size: number; modifiedAt: number; identity?: string };
   const refreshActivity = Effect.fn("ClaudeSessionAttachment.refreshActivity")(function* (
     thread: OrchestrationV2AppThread,
     parent: OrchestrationV2AppThread | null,
     agentId: string | null,
+    snapshot?: Tail,
   ) {
     const external = thread.externalSession!;
-    const tail = yield* source.tail(external.configDirectory, external.transcriptPath);
+    const tail =
+      snapshot ?? (yield* source.tail(external.configDirectory, external.transcriptPath));
     const now = yield* DateTime.now;
     const activityStatus =
       DateTime.toEpochMillis(now) - tail.modifiedAt < 120_000
         ? ("running" as const)
         : ("idle" as const);
-    const stamp = `${tail.size}:${tail.modifiedAt}:${activityStatus}:${thread.lineage.parentThreadId}`;
-    if (activitySnapshots.get(thread.id) === stamp) return;
+    const stamp = `${tail.identity ?? ""}:${tail.size}:${tail.modifiedAt}:${activityStatus}:${thread.lineage.parentThreadId}`;
+    if (activitySnapshots.get(thread.id) === stamp) return false;
     const previousSubagent = parent
       ? (yield* projections.getThreadRecords(parent.id, ["subagents"], {
           subagentIds: [attachmentNodeId(thread.id)],
@@ -407,51 +461,95 @@ const make = Effect.gen(function* () {
       }
     }
     activitySnapshots.set(thread.id, stamp);
+    return true;
   });
   const childOffsets = new Map<string, number>();
+  const syncGate = yield* Semaphore.make(1);
+  let backfillPending = false;
   const sync = Effect.gen(function* () {
+    backfillPending = false;
     const rows = yield* sql<{ thread_id: string }>`
       SELECT thread_id FROM orchestration_v2_projection_threads
       WHERE json_extract(payload_json, '$.externalSession.attached') = 1
         AND json_extract(payload_json, '$.lineage.parentThreadId') IS NULL
         AND json_extract(payload_json, '$.deletedAt') IS NULL
     `;
+    const activeRoots = new Set(rows.map((row) => row.thread_id));
+    for (const rootId of childOffsets.keys()) {
+      if (!activeRoots.has(rootId)) childOffsets.delete(rootId);
+    }
+    if (!rows.length) {
+      activitySnapshots.clear();
+      syncedFiles.clear();
+    }
     for (const row of rows) {
       const thread = yield* projections.getThread(ThreadId.make(row.thread_id));
       const external = thread.externalSession!;
       yield* Effect.gen(function* () {
-        // Prioritize root history, including one-time reclassification of older imports.
-        for (let pass = 0; pass < 8; pass++) {
+        yield* Effect.gen(function* () {
           const current = yield* projections.getThread(thread.id);
-          if (yield* followFile(current, null, null)) break;
-        }
-        yield* refreshActivity(thread, null, null);
+          if (!current.externalSession?.attached || current.deletedAt !== null) return;
+          const changed = yield* refreshActivity(current, null, null);
+          if (
+            (changed || current.externalSession.state !== "following") &&
+            !(yield* followFile(current, null, null))
+          )
+            backfillPending = true;
+        }).pipe(gate.withPermit);
         const children = yield* source.children(external.configDirectory, external.transcriptPath);
         // Bound each pass so a large agent tree cannot starve detach or other sessions.
         const start = childOffsets.get(thread.id) ?? 0;
         const batch = Array.from(
-          { length: Math.min(16, children.length) },
+          { length: Math.min(64, children.length) },
           (_, i) => children[(start + i) % children.length]!,
         );
         childOffsets.set(thread.id, children.length ? (start + batch.length) % children.length : 0);
         for (const child of children) {
           yield* Effect.gen(function* () {
+            const childId = attachmentThreadId(
+              external.configDirectory,
+              external.sessionId,
+              child.agentId,
+            );
+            const tail = yield* source.tail(external.configDirectory, child.path);
+            const now = yield* DateTime.now;
+            const stamp = `${tail.identity ?? ""}:${tail.size}:${tail.modifiedAt}:${DateTime.toEpochMillis(now) - tail.modifiedAt < 120_000}`;
+            if (syncedFiles.get(childId) === stamp) return;
+            const currentRoot = yield* projections.getThread(thread.id);
+            if (!currentRoot.externalSession?.attached || currentRoot.deletedAt !== null) return;
             const childThread = yield* create(thread, {
+              configDirectory: external.configDirectory,
+              providerInstanceId: thread.providerInstanceId,
               sessionId: external.sessionId,
               transcriptPath: child.path,
               title: `Claude subagent ${child.agentId}`,
               projectId: thread.projectId,
               agentId: child.agentId,
             });
-            if (batch.includes(child)) yield* followFile(childThread, thread, child.agentId);
-            yield* refreshActivity(childThread, thread, child.agentId);
-          }).pipe(Effect.catch(() => setState(thread.id, "unavailable")));
+            const changed = yield* refreshActivity(childThread, thread, child.agentId, tail);
+            if (batch.includes(child)) {
+              const caughtUp =
+                !changed && childThread.externalSession?.state === "following"
+                  ? true
+                  : yield* followFile(childThread, thread, child.agentId);
+              if (caughtUp) syncedFiles.set(childId, stamp);
+              else backfillPending = true;
+            } else {
+              yield* setState(childThread.id, "connecting");
+              backfillPending = true;
+            }
+          }).pipe(
+            gate.withPermit,
+            Effect.catch(() => setState(thread.id, "unavailable")),
+          );
         }
       }).pipe(Effect.catch(() => setState(thread.id, "unavailable")));
     }
   }).pipe(
-    gate.withPermit,
-    Effect.mapError((cause) => new ClaudeSessionAttachmentError({ cause })),
+    syncGate.withPermit,
+    Effect.mapError((cause) =>
+      isAttachmentError(cause) ? cause : new ClaudeSessionAttachmentError({ cause }),
+    ),
   );
 
   const change = Effect.fn("ClaudeSessionAttachment.change")(
@@ -476,15 +574,52 @@ const make = Effect.gen(function* () {
       const project = yield* projects.getById(input.projectId);
       if (Option.isNone(project))
         return yield* new ClaudeSessionAttachmentError({ cause: "Project does not exist" });
+      const providerInstanceId = input.providerInstanceId ?? ProviderInstanceId.make("claudeAgent");
+      const configured = (yield* settings.getSettings).providerInstances[providerInstanceId];
+      if (configured && configured.driver !== "claudeAgent")
+        return yield* new ClaudeSessionAttachmentError({
+          reason: "unsupported-provider",
+          cause: "Provider has no live attachment adapter",
+        });
+      if (
+        (!configured && providerInstanceId !== "claudeAgent") ||
+        (configured && !resolveProviderInstanceEnabled(configured))
+      )
+        return yield* new ClaudeSessionAttachmentError({
+          reason: "unavailable-instance",
+          cause: "Provider instance is missing or disabled",
+        });
+      const config = yield* decodeClaudeSettings(configured?.config ?? {});
+      const instanceEnvironment = yield* mergeProviderInstanceEnvironment(
+        configured?.environment,
+        environment,
+      ).pipe(
+        Effect.provideService(HostProcess.HomeDirectory, home),
+        Effect.provideService(HostProcess.Platform, platform),
+      );
+      const configDirectory = yield* resolveClaudeHomePath(config, instanceEnvironment).pipe(
+        Effect.provideService(Path.Path, path),
+        Effect.provideService(HostProcess.HomeDirectory, home),
+      );
       const discovered = yield* source.discover(configDirectory, input.session);
-      const thread = yield* create(null, { ...discovered, projectId: input.projectId });
+      const thread = yield* create(null, {
+        ...discovered,
+        configDirectory,
+        providerInstanceId,
+        projectId: input.projectId,
+      });
       yield* setState(thread.id, "connecting");
       return { threadId: thread.id, attached: true, readOnly: false };
     },
     gate.withPermit,
-    Effect.mapError((cause) => new ClaudeSessionAttachmentError({ cause })),
+    Effect.mapError((cause) =>
+      isAttachmentError(cause) ? cause : new ClaudeSessionAttachmentError({ cause }),
+    ),
   );
-  yield* sync.pipe(Effect.ignore(), Effect.repeat(Schedule.spaced("2 seconds")), forkParked);
+  yield* Effect.gen(function* () {
+    yield* sync.pipe(Effect.ignore());
+    yield* Effect.sleep(backfillPending ? "10 millis" : "2 seconds");
+  }).pipe(Effect.forever, forkParked);
   return ClaudeSessionAttachment.of({ change, sync });
 });
 export const layer = Layer.effect(ClaudeSessionAttachment, make);

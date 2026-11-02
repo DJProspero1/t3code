@@ -319,6 +319,7 @@ const layerThreadTitleRegenerationProvided = ThreadTitleRegenerationService.laye
 const layerEffectExecutorProvided = EffectWorker.layerExecutor.pipe(
   Layer.provide(
     Layer.mergeAll(
+      layerStores,
       layerEventSink,
       layerRunFinalizationServiceProvided,
       layerCheckpointRollbackServiceProvided,

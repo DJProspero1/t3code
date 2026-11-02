@@ -1,5 +1,10 @@
 import { expect, it } from "@effect/vitest";
-import { ProjectId } from "@t3tools/contracts";
+import {
+  DEFAULT_SERVER_SETTINGS,
+  ProviderInstanceId,
+  ProviderDriverKind,
+  ProjectId,
+} from "@t3tools/contracts";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
@@ -12,6 +17,7 @@ import * as EventStore from "../orchestration-v2/EventStore.ts";
 import * as ProjectionStore from "../orchestration-v2/ProjectionStore.ts";
 import * as Sqlite from "../persistence/Sqlite.ts";
 import { ServerActivation } from "../serverActivation.ts";
+import * as ServerSettings from "../serverSettings.ts";
 import * as Source from "./ClaudeAttachmentSource.ts";
 import * as Attachment from "./ClaudeSessionAttachment.ts";
 import * as Project from "./ProjectService.ts";
@@ -32,6 +38,7 @@ it.effect(
     Effect.gen(function* () {
       const projectId = ProjectId.make("project");
       const files = new Map<string, string[]>();
+      let readCalls = 0;
       const rootPath = "/claude/projects/project/session.jsonl";
       const childPath = (id: string) => `${rootPath.slice(0, -6)}/subagents/agent-${id}.jsonl`;
       const rootLine = JSON.stringify({
@@ -72,6 +79,7 @@ it.effect(
           })),
         read: (_home, path, cursor) =>
           Effect.sync(() => {
+            readCalls++;
             const lines = files.get(path) ?? [];
             return {
               lines: lines.slice(cursor.offset),
@@ -86,6 +94,19 @@ it.effect(
         sql<{ count: number }>`SELECT count(*) AS count FROM orchestration_v2_projection_messages`;
       const deps = Layer.mergeAll(
         source,
+        Layer.mock(ServerSettings.ServerSettingsService)({
+          getSettings: Effect.succeed({
+            ...DEFAULT_SERVER_SETTINGS,
+            providerInstances: {
+              work: {
+                driver: ProviderDriverKind.make("claudeAgent"),
+                config: { homePath: "~/claude-work" },
+              },
+              disabled: { driver: ProviderDriverKind.make("claudeAgent"), enabled: false },
+              codex: { driver: ProviderDriverKind.make("codex") },
+            },
+          }),
+        }),
         Layer.succeed(ProjectionStore.ProjectionStoreV2, projection),
         Layer.succeed(EventSink.EventSinkV2, yield* EventSink.EventSinkV2),
         Layer.succeed(SqlClient.SqlClient, sql),
@@ -118,6 +139,9 @@ it.effect(
       expect(
         (yield* projection.getThreadRecords(attached.threadId, ["subagents"])).subagents,
       ).toHaveLength(1);
+      const initialReads = readCalls;
+      yield* first.sync;
+      expect(readCalls).toBe(initialReads);
       files.set(childPath("child-two"), [reply("child-two")]);
       files.get(childPath("child-one"))!.push(
         JSON.stringify({
@@ -196,7 +220,7 @@ it.effect(
       expect((yield* projection.getThreadRecords(prior.id, ["messages"])).messages[0]?.role).toBe(
         "system",
       );
-      expect((yield* projection.getThread(prior.id)).externalSession?.projectionVersion).toBe(2);
+      expect((yield* projection.getThread(prior.id)).externalSession?.projectionVersion).toBe(3);
       yield* restarted.change({ action: "detach", threadId: attached.threadId });
       expect(
         (yield* projection.getThread(attachmentThreadId("/claude", "session", "child-two")))
@@ -208,5 +232,73 @@ it.effect(
       expect((yield* projection.getThread(attached.threadId)).externalSession?.state).toBe(
         "detached",
       );
+      const work = yield* restarted.change({
+        action: "attach",
+        projectId,
+        session: "repair-session",
+        providerInstanceId: ProviderInstanceId.make("work"),
+      });
+      expect(work.threadId).not.toBe(attached.threadId);
+      expect(yield* projection.getThread(work.threadId)).toMatchObject({
+        providerInstanceId: "work",
+        externalSession: { configDirectory: "/claude-work" },
+      });
+      for (const providerInstanceId of ["disabled", "codex", "missing"]) {
+        expect(
+          (yield* restarted
+            .change({
+              action: "attach",
+              projectId,
+              session: "repair-session",
+              providerInstanceId: ProviderInstanceId.make(providerInstanceId),
+            })
+            .pipe(Effect.flip))._tag,
+        ).toBe("ClaudeSessionAttachmentError");
+      }
+      const sink = yield* EventSink.EventSinkV2;
+      const beforeRename = yield* projection.getThread(work.threadId);
+      yield* sink.write({
+        events: [
+          attachmentEvent(
+            work.threadId,
+            "thread.metadata-updated",
+            {
+              ...beforeRename,
+              title: "User renamed this",
+            },
+            at,
+            "rename",
+          ),
+        ],
+      });
+      expect(
+        yield* sink.write({
+          expectedThread: beforeRename,
+          events: [
+            attachmentEvent(
+              work.threadId,
+              "thread.metadata-updated",
+              {
+                ...beforeRename,
+                externalSession: { ...beforeRename.externalSession!, state: "following" },
+              },
+              at,
+              "stale-sync",
+            ),
+          ],
+        }),
+      ).toEqual([]);
+      expect((yield* projection.getThread(work.threadId)).title).toBe("User renamed this");
+      for (let i = 0; i < 80; i++)
+        files.set(childPath(`large-tree-${i}`), [reply(`large-tree-${i}`)]);
+      yield* restarted.sync;
+      yield* restarted.sync;
+      const lastChild = attachmentThreadId("/claude-work", "session", "large-tree-79");
+      expect((yield* projection.getThreadRecords(lastChild, ["messages"])).messages).toHaveLength(
+        1,
+      );
+      const caughtUpReads = readCalls;
+      yield* restarted.sync;
+      expect(readCalls).toBe(caughtUpReads);
     }).pipe(Effect.provide(persistence)),
 );

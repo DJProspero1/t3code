@@ -1,4 +1,5 @@
-import { sendClaudeMessage } from "../project/ClaudeSessionControl.ts";
+import { sendClaudeMessage } from "../provider/ClaudeSessionControl.ts";
+import * as ProjectionStore from "./ProjectionStore.ts";
 import * as EventSink from "./EventSink.ts";
 import { attachmentEvent } from "../project/claudeAttachmentProjection.ts";
 import { CommandId, TurnItemId } from "@t3tools/contracts";
@@ -98,6 +99,7 @@ export const layerExecutor: Layer.Layer<
     const threads = yield* ThreadManagementService.ThreadManagementService;
     const settings = yield* ServerSettings.ServerSettingsService;
     const externalSink = yield* Effect.serviceOption(EventSink.EventSinkV2);
+    const externalProjections = yield* Effect.serviceOption(ProjectionStore.ProjectionStoreV2);
     return OrchestrationEffectExecutorV2.of({
       execute: Effect.fn("OrchestrationEffectExecutorV2.execute")(function (effect, options) {
         const willRetry = options?.willRetry ?? false;
@@ -110,8 +112,18 @@ export const layerExecutor: Layer.Layer<
                   effectId: effect.id,
                   effectType: request.type,
                 });
+              const target =
+                effect.attemptCount <= 1 && Option.isSome(externalProjections)
+                  ? yield* externalProjections.value.getThread(effect.threadId).pipe(Effect.option)
+                  : Option.none();
+              const maySend =
+                Option.isSome(target) &&
+                target.value.deletedAt === null &&
+                target.value.externalSession?.attached === true &&
+                target.value.externalSession.sessionId === request.sessionId &&
+                target.value.externalSession.configDirectory === request.configDirectory;
               const delivered =
-                effect.attemptCount <= 1 &&
+                maySend &&
                 (yield* sendClaudeMessage(request).pipe(
                   Effect.match({ onSuccess: () => true, onFailure: () => false }),
                 ));
@@ -126,6 +138,7 @@ export const layerExecutor: Layer.Layer<
                 completedAt: delivered ? now : null,
               };
               yield* externalSink.value.write({
+                skipExistingEventIds: true,
                 events: [
                   attachmentEvent(
                     effect.threadId,

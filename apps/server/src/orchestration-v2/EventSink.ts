@@ -1,4 +1,5 @@
 import {
+  OrchestrationV2AppThread,
   CommandId,
   type OrchestrationV2Run,
   OrchestrationV2DomainEvent,
@@ -66,11 +67,14 @@ export class EventSinkStreamError extends Schema.TaggedError<EventSinkStreamErro
 export const EventSinkV2Error = Schema.Union([EventSinkWriteError, EventSinkStreamError]);
 export type EventSinkV2Error = typeof EventSinkV2Error.Type;
 
+const sameThread = Schema.toEquivalence(OrchestrationV2AppThread);
+
 const encodeEventIds = Schema.encodeSync(Schema.fromJsonString(Schema.Array(Schema.String)));
 
 export interface EventSinkV2Shape {
   readonly write: (input: {
     /** Idempotent ingestion of source records whose event IDs are deterministic. */
+    readonly expectedThread?: OrchestrationV2AppThread;
     readonly skipExistingEventIds?: boolean;
     /** Return no events if another thread owns this native session at commit time. */
     readonly unlessNativeThreadOwned?: Pick<
@@ -82,6 +86,7 @@ export interface EventSinkV2Shape {
     readonly events: ReadonlyArray<OrchestrationV2DomainEvent>;
   }) => Effect.Effect<ReadonlyArray<OrchestrationV2StoredEvent>, EventSinkV2Error>;
   readonly writeWithEffects: (input: {
+    readonly expectedThread?: OrchestrationV2AppThread;
     readonly skipExistingEventIds?: boolean;
     /**
      * Rebuilds each run.updated from the stored row with only its delegatedCompletion replaced.
@@ -423,6 +428,10 @@ const layerBase: Layer.Layer<
 
       const { committed } = yield* commitThenPublish(
         Effect.gen(function* () {
+          if (input.expectedThread) {
+            const current = yield* projectionStore.getThread(input.expectedThread.id);
+            if (!sameThread(current, input.expectedThread)) return { committed: [], outcomes: [] };
+          }
           // Check ownership in the same transaction that claims the native session.
           const imported = input.unlessNativeThreadOwned;
           if (imported?.nativeThreadRef != null) {

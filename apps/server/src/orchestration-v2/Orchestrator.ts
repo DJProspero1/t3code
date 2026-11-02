@@ -1,5 +1,4 @@
-import { projectAttachmentLine } from "../project/claudeAttachmentProjection.ts";
-import { canMutateExternalSession } from "./externalSessionPolicy.ts";
+import { canMutateExternalSession, projectExternalMessage } from "./externalSessionPolicy.ts";
 import type {
   GuestShareId,
   OrchestrationV2SearchThreadInput,
@@ -619,7 +618,6 @@ function commandThreadId(command: OrchestrationV2ServerCommand): ThreadId {
 }
 
 // Validate before resolving the request: adapters may otherwise coerce unusable answers.
-const encodeExternalRecord = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
 
 const decodeUserInputAnswers = Schema.decodeUnknownEffect(
   Schema.Record(
@@ -13152,6 +13150,20 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
             ),
           );
         if (thread.externalSession) {
+          // T3 cannot narrow permissions of a process owned by an external client.
+          yield* refuseAboveDispatchModeLimit(command, thread.id, {
+            runtimeMode: "full-access",
+            interactionMode: "default",
+          });
+          if (runtimeModeCeiling && runtimeModeCeiling.maxRuntimeMode !== "full-access") {
+            return yield* new OrchestratorRuntimeModeAboveCeilingError({
+              commandId: command.commandId,
+              threadId: thread.id,
+              runtimeMode: "full-access",
+              refused: "turn",
+              ...runtimeModeCeiling,
+            });
+          }
           const external = thread.externalSession;
           if (
             !external.attached ||
@@ -13167,21 +13179,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
             });
           }
           const now = yield* DateTime.now;
-          const projected = projectAttachmentLine({
-            messageId: command.messageId,
-            thread,
-            parent: null,
-            agentId: null,
-            ordinal: DateTime.toEpochMillis(now),
-            includeActivity: false,
-            line: encodeExternalRecord({
-              type: "user",
-              uuid: command.messageId,
-              sessionId: external.sessionId,
-              timestamp: DateTime.formatIso(now),
-              message: { content: command.text },
-            }),
-          });
+          const projected = projectExternalMessage(command, now);
           const itemEvent = projected.find((event) => event.type === "turn-item.updated");
           if (!itemEvent || itemEvent.type !== "turn-item.updated")
             return yield* new OrchestratorDispatchError({
@@ -13189,35 +13187,8 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
               commandType: command.type,
               cause: "Empty external message",
             });
-          const item = {
-            ...itemEvent.payload,
-            status: "pending" as const,
-            completedAt: null,
-            title: "Sending to Claude's live inbox",
-            ...(itemEvent.payload.type === "user_message"
-              ? {
-                  createdBy: command.createdBy ?? "user",
-                  creationSource: command.creationSource ?? "web",
-                }
-              : {}),
-          };
-          yield* Ref.update(events, (existing) => [
-            ...existing,
-            ...projected.map((event) =>
-              event.type === "turn-item.updated"
-                ? { ...event, payload: item }
-                : event.type === "message.updated"
-                  ? {
-                      ...event,
-                      payload: {
-                        ...event.payload,
-                        createdBy: command.createdBy ?? "user",
-                        creationSource: command.creationSource ?? "web",
-                      },
-                    }
-                  : event,
-            ),
-          ]);
+          const item = itemEvent.payload;
+          yield* Ref.update(events, (existing) => [...existing, ...projected]);
           yield* Ref.update(effects, (existing) => [
             ...existing,
             {

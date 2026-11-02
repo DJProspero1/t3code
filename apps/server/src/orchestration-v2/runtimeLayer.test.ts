@@ -1,4 +1,5 @@
 import { SourceControlProviderKind } from "@t3tools/contracts";
+import * as ClaudeSessionControl from "../provider/ClaudeSessionControl.ts";
 import { limitRecoveryCommand } from "./UsageLimitRecoveryWorker.ts";
 import * as McpProviderSessions from "@t3tools/provider-core/server/McpProviderSessions";
 import * as SourceControlProviderRegistry from "../sourceControl/SourceControlProviderRegistry.ts";
@@ -857,6 +858,100 @@ const layerSharedApplicationDataPlaneTest = Layer.mergeAll(
 );
 
 it.layer(layerTest)("OrchestrationV2LayerLive", (it) => {
+  it.effect.each([true, false])(
+    "checks attachment ownership before delivery (attached=%s)",
+    (attached) =>
+      Effect.gen(function* () {
+        const sent: string[] = [];
+        const spy = yield* Effect.acquireRelease(
+          Effect.sync(() =>
+            vi.spyOn(ClaudeSessionControl, "sendClaudeMessage").mockImplementation((input) =>
+              Effect.sync(() => {
+                sent.push(input.text);
+              }),
+            ),
+          ),
+          (mock) => Effect.sync(() => mock.mockRestore()),
+        );
+        const orchestrator = yield* Orchestrator.OrchestratorV2;
+        const sink = yield* EventSink.EventSinkV2;
+        const outbox = yield* EffectOutbox.EffectOutboxV2;
+        const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
+        const threadId = ThreadId.make(`external-delivery-${attached}`);
+        yield* orchestrator.dispatch({
+          type: "thread.create",
+          commandId: CommandId.make(`${threadId}-create`),
+          createdBy: "user",
+          creationSource: "web",
+          threadId,
+          projectId: ProjectId.make("external-delivery-project"),
+          title: "External delivery",
+          modelSelection,
+          runtimeMode: "full-access",
+          interactionMode: "default",
+          branch: null,
+          worktreePath: null,
+        });
+        const thread = (yield* orchestrator.getThreadRecords(threadId, [])).thread;
+        const now = yield* DateTime.now;
+        yield* sink.write({
+          events: [
+            {
+              id: EventId.make(`${threadId}-attach`),
+              threadId,
+              type: "thread.metadata-updated",
+              occurredAt: now,
+              payload: {
+                ...thread,
+                externalSession: {
+                  provider: "claude",
+                  sessionId: "session",
+                  configDirectory: "/fixture",
+                  transcriptPath: "/fixture/session.jsonl",
+                  attached,
+                  state: attached ? "following" : "detached",
+                },
+              },
+            },
+          ],
+        });
+        yield* outbox.enqueue([
+          {
+            id: `${threadId}-send`,
+            commandId: CommandId.make(`${threadId}-send`),
+            threadId,
+            request: {
+              type: "external-session.send",
+              sessionId: "session",
+              configDirectory: "/fixture",
+              uuid: "message",
+              text: "Exact user prompt",
+              item: {
+                id: TurnItemId.make(`${threadId}-item`),
+                threadId,
+                runId: null,
+                nodeId: null,
+                providerThreadId: null,
+                providerTurnId: null,
+                nativeItemRef: null,
+                parentItemId: null,
+                ordinal: 1,
+                status: "pending",
+                title: null,
+                startedAt: now,
+                completedAt: null,
+                updatedAt: now,
+                type: "system_notice",
+                message: "fixture",
+              },
+            },
+          },
+        ]);
+        yield* worker.drain();
+        assert.deepEqual(sent, attached ? ["Exact user prompt"] : []);
+        assert.equal(spy.mock.calls.length, attached ? 1 : 0);
+      }),
+  );
   const seedFailingRollbackThread = (name: string) =>
     Effect.gen(function* () {
       const orchestrator = yield* Orchestrator.OrchestratorV2;

@@ -1,5 +1,5 @@
 import {
-  OrchestrationV2TurnItem,
+  OrchestrationV2TurnItemJson,
   CheckpointId,
   CheckpointScopeId,
   CommandId,
@@ -37,7 +37,7 @@ export const OrchestrationEffectRequestV2 = Schema.Union([
     sessionId: Schema.String,
     uuid: Schema.String,
     text: Schema.String,
-    item: OrchestrationV2TurnItem,
+    item: OrchestrationV2TurnItemJson,
   }),
   Schema.Struct({
     type: Schema.Literal("provider-runtime.continue"),

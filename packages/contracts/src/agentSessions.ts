@@ -65,6 +65,7 @@ export const ClaudeSessionAttachmentInput = Schema.Union([
     action: Schema.Literal("attach"),
     projectId: ProjectId,
     session: TrimmedNonEmptyString,
+    providerInstanceId: Schema.optional(ProviderInstanceId),
   }),
   Schema.Struct({ action: Schema.Literal("detach"), threadId: ThreadId }),
 ]);

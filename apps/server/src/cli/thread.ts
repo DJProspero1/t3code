@@ -761,6 +761,7 @@ const threadShowCommand = Command.make("show", {
 const threadAttachCommand = Command.make("attach", {
   ...projectLocationFlags,
   session: Argument.String("session"),
+  provider: Flag.String("provider").pipe(Flag.optional),
   project: Flag.String("project").pipe(Flag.withDefault(".")),
   json: jsonFlag,
 }).pipe(
@@ -774,7 +775,15 @@ const threadAttachCommand = Command.make("attach", {
         const project = yield* resolveProject(tools, flags.project);
         const result = yield* tools.call(
           "t3_thread_attach",
-          { action: "attach", projectId: project.id, session: flags.session },
+          {
+            action: "attach",
+            projectId: project.id,
+            session: flags.session,
+            ...Option.match(flags.provider, {
+              onNone: () => ({}),
+              onSome: (providerInstanceId) => ({ providerInstanceId }),
+            }),
+          },
           ClaudeSessionAttachmentResult,
         );
         yield* flags.json

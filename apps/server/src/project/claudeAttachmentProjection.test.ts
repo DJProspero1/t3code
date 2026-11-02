@@ -63,6 +63,66 @@ const record = {
 };
 
 describe("external Claude projection", () => {
+  it("joins native tool results to their calls without claiming unfinished history is running", () => {
+    const call = projectAttachmentLine({
+      thread,
+      parent: null,
+      agentId: null,
+      ordinal: 10,
+      includeActivity: false,
+      line: JSON.stringify({
+        ...record,
+        uuid: "tool-call",
+        message: {
+          content: [
+            { type: "tool_use", id: "call-1", name: "Read", input: { file_path: "file.txt" } },
+          ],
+        },
+      }),
+    });
+    const item = call.find((event) => event.type === "turn-item.updated")!.payload;
+    expect(item).toMatchObject({
+      type: "dynamic_tool",
+      status: "idle",
+      toolName: "Read",
+      input: { file_path: "file.txt" },
+    });
+    const result = projectAttachmentLine({
+      thread,
+      parent: null,
+      agentId: null,
+      ordinal: 20,
+      includeActivity: false,
+      previousTools: new Map([["call-1", item]]),
+      line: JSON.stringify({
+        ...record,
+        type: "user",
+        uuid: "tool-result",
+        message: {
+          content: [
+            {
+              type: "tool_result",
+              tool_use_id: "call-1",
+              content: "File contents",
+              is_error: false,
+            },
+          ],
+        },
+      }),
+    });
+    expect(result).toHaveLength(1);
+    expect(result[0]?.payload).toMatchObject({
+      id: item.id,
+      type: "dynamic_tool",
+      status: "completed",
+      ordinal: 10,
+      toolName: "Read",
+      input: { file_path: "file.txt" },
+      output: "File contents",
+    });
+    for (const event of [...call, ...result]) expect(isEvent(event)).toBe(true);
+  });
+
   it("projects native child history and completion without creating a provider turn or replaying a prompt", () => {
     const events = projectAttachmentLine({
       thread,

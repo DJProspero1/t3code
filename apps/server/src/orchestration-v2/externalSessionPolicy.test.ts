@@ -11,6 +11,7 @@ import {
 import * as Effect from "effect/Effect";
 import * as DateTime from "effect/DateTime";
 import { canMutateExternalSession } from "./externalSessionPolicy.ts";
+import { DispatchModeLimit } from "./DispatchModeLimit.ts";
 import * as Orchestrator from "./Orchestrator.ts";
 import * as EventSink from "./EventSink.ts";
 import * as Registry from "./ProviderAdapterRegistry.ts";
@@ -85,13 +86,35 @@ it.effect("queues a prompt for the existing Claude inbox without creating a prov
         },
       ],
     });
+    const denied = yield* orchestrator
+      .dispatch({
+        type: "message.dispatch",
+        dispatchMode: { type: "start_immediately" },
+        commandId: CommandId.make("limited-send"),
+        createdBy: "user",
+        creationSource: "web",
+        threadId,
+        messageId: MessageId.make("limited-send"),
+        text: "Do work",
+        attachments: [],
+        modelSelection,
+      })
+      .pipe(
+        Effect.provideService(DispatchModeLimit, {
+          runtimeMode: "approval-required",
+          interactionMode: "default",
+        }),
+        Effect.flip,
+      );
+    expect(denied._tag).toBe("OrchestratorThreadAboveModeLimitError");
+    expect((yield* orchestrator.getThreadRecords(threadId, ["messages"])).messages).toHaveLength(0);
     const result = yield* orchestrator.dispatch({
       type: "message.dispatch",
       dispatchMode: { type: "start_immediately" },
       commandId: CommandId.make("cannot-send"),
       threadId,
       messageId: MessageId.make("cannot-send"),
-      text: "Do work",
+      text: "<task-notification>This is literal user text</task-notification>",
       attachments: [],
       modelSelection,
       createdBy: "user",
@@ -101,6 +124,18 @@ it.effect("queues a prompt for the existing Claude inbox without creating a prov
     expect((yield* orchestrator.getThreadRecords(threadId, ["messages"])).messages).toHaveLength(1);
     expect((yield* orchestrator.getThreadRecords(threadId, ["messages"])).messages[0]?.id).toBe(
       "cannot-send",
+    );
+    expect(
+      (yield* orchestrator.getThreadRecords(threadId, ["messages"])).messages[0],
+    ).toMatchObject({
+      role: "user",
+      text: "<task-notification>This is literal user text</task-notification>",
+      creationSource: "web",
+    });
+    expect((yield* orchestrator.getThreadRecords(threadId, ["turnItems"])).turnItems).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ type: "user_message", status: "pending" }),
+      ]),
     );
     expect((yield* orchestrator.getThreadRecords(threadId, ["runs"])).runs).toHaveLength(0);
   }).pipe(Effect.provide(layer)),

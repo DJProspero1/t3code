@@ -148,7 +148,8 @@ Older imports are repaired in the background after an upgrade.
 History loads separately from current activity. Completed subagents are shown as
 completed even while their older messages are still importing. A child with no
 recent activity and no recorded final outcome is shown as idle, not assumed to be
-running. Tool output and pending permission dialogs are not mirrored.
+running. Tool calls and their results appear in the timeline. Pending permission
+dialogs still require Claude Code.
 
 To stop syncing while keeping the imported history:
 
@@ -157,5 +158,9 @@ t3 thread detach THREAD_ID
 ```
 
 Claude and its agents keep running. Repeat `attach` to reconnect the same T3 thread.
-The initial implementation follows the server's default Claude configuration
-folder, including `CLAUDE_CONFIG_DIR` when set.
+Use `--provider INSTANCE_ID` to select another configured Claude account. Attachment
+uses that instance's home folder and environment settings. A disabled or different
+provider is rejected before any thread is created. The default instance is `claudeAgent`.
+
+Sending requires full-access permission because T3 cannot reduce the permissions
+of an externally owned process. T3's managed permission ceiling still applies.

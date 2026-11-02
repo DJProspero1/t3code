@@ -45,7 +45,7 @@ export class ClaudeAttachmentSource extends Context.Service<
       home: string,
       path: string,
     ) => Effect.Effect<
-      { lines: ReadonlyArray<string>; size: number; modifiedAt: number },
+      { lines: ReadonlyArray<string>; size: number; modifiedAt: number; identity?: string },
       ClaudeAttachmentSourceError
     >;
     readonly discover: (
@@ -97,14 +97,16 @@ async function checkedPath(home: string, file: string) {
   return actual;
 }
 
-const tailCache = new Map<
-  string,
-  { stamp: string; result: { lines: string[]; size: number; modifiedAt: number } }
->();
+export const layer = Layer.sync(ClaudeAttachmentSource, () => {
+  const tailCache = new Map<
+    string,
+    {
+      stamp: string;
+      result: { lines: string[]; size: number; modifiedAt: number; identity: string };
+    }
+  >();
 
-export const layer = Layer.succeed(
-  ClaudeAttachmentSource,
-  ClaudeAttachmentSource.of({
+  return ClaudeAttachmentSource.of({
     tail: Effect.fn("ClaudeAttachmentSource.tail")((home, path) =>
       Effect.tryPromise({
         try: async () => {
@@ -126,6 +128,7 @@ export const layer = Layer.succeed(
                 end >= start
                   ? complete.subarray(start, end).toString("utf8").split("\n").slice(-64)
                   : [],
+              identity: `${stat.dev}:${stat.ino}`,
               size: stat.size,
               modifiedAt: stat.mtimeMs,
             };
@@ -236,5 +239,5 @@ export const layer = Layer.succeed(
         catch: (cause) => new ClaudeAttachmentSourceError({ operation: "read", cause }),
       }),
     ),
-  }),
-);
+  });
+});

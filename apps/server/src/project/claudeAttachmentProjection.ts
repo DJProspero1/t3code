@@ -11,6 +11,7 @@ import {
   type OrchestrationV2ConversationMessage,
   type OrchestrationV2DomainEvent,
   type OrchestrationV2Subagent,
+  type OrchestrationV2TurnItem,
 } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
 import * as Option from "effect/Option";
@@ -38,6 +39,12 @@ const Record = Schema.Struct({
             Schema.Struct({
               type: Schema.String,
               text: Schema.optional(Schema.String),
+              id: Schema.optional(Schema.String),
+              name: Schema.optional(Schema.String),
+              input: Schema.optional(Schema.Unknown),
+              tool_use_id: Schema.optional(Schema.String),
+              content: Schema.optional(Schema.Unknown),
+              is_error: Schema.optional(Schema.Boolean),
             }),
           ),
         ]),
@@ -60,6 +67,11 @@ export function attachmentDetails(line: string, sessionId: string) {
   const spawn = decodeSpawn(record.value.toolUseResult);
   return {
     uuid: record.value.uuid,
+    toolResults: Array.isArray(record.value.message?.content)
+      ? record.value.message.content.flatMap((block) =>
+          block.type === "tool_result" && block.tool_use_id ? [block.tool_use_id] : [],
+        )
+      : [],
     isPeer: record.value.origin?.kind === "peer",
     model: record.value.message?.model,
     spawn: Option.getOrNull(spawn),
@@ -101,6 +113,7 @@ export function projectAttachmentLine(input: {
   messageId?: MessageId;
   sentMessage?: OrchestrationV2ConversationMessage | undefined;
   previousSubagent?: OrchestrationV2Subagent | undefined;
+  previousTools?: ReadonlyMap<string, OrchestrationV2TurnItem>;
 }): ReadonlyArray<OrchestrationV2DomainEvent> {
   const decoded = decodeRecord(input.line);
   if (Option.isNone(decoded)) return [];
@@ -212,6 +225,47 @@ export function projectAttachmentLine(input: {
         key,
       ),
     );
+  }
+  if (Array.isArray(content)) {
+    for (const block of content) {
+      const id =
+        block.type === "tool_use"
+          ? block.id
+          : block.type === "tool_result"
+            ? block.tool_use_id
+            : undefined;
+      if (!id) continue;
+      const previous = input.previousTools?.get(id);
+      const result = block.type === "tool_result";
+      const item: OrchestrationV2TurnItem = {
+        id: TurnItemId.make(`${thread.id}:tool:${id}`),
+        threadId: thread.id,
+        runId: null,
+        nodeId: null,
+        providerThreadId: thread.activeProviderThreadId,
+        providerTurnId: null,
+        nativeItemRef: {
+          driver: ProviderDriverKind.make("claudeAgent"),
+          nativeId: id,
+          strength: "strong",
+        },
+        parentItemId: null,
+        ordinal: previous?.ordinal ?? input.ordinal,
+        status: result ? (block.is_error ? "failed" : "completed") : "idle",
+        title: previous?.title ?? block.name ?? "External tool",
+        startedAt: previous?.startedAt ?? at,
+        completedAt: result ? at : null,
+        updatedAt: at,
+        type: "dynamic_tool",
+        toolName:
+          previous?.type === "dynamic_tool" ? previous.toolName : block.name?.trim() || null,
+        input: previous?.type === "dynamic_tool" ? previous.input : (block.input ?? null),
+        ...(result ? { output: block.content ?? null } : {}),
+      };
+      events.push(
+        attachmentEvent(thread.id, "turn-item.updated", item, at, `tools-v1:${key}:${id}`),
+      );
+    }
   }
   if (input.includeActivity === false) return events;
   const activityKey = `${key}:activity-v2:${input.activityKey ?? "history"}`;
