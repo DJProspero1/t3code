@@ -92,6 +92,96 @@ describe("external Claude projection", () => {
     });
     expect(again).toEqual(events);
   });
+  it("keeps human wording exact and classifies harness traffic as system activity", () => {
+    const project = (extra: object) =>
+      projectAttachmentLine({
+        thread,
+        parent: null,
+        agentId: null,
+        ordinal: 1,
+        includeActivity: false,
+        line: JSON.stringify({
+          ...record,
+          type: "user",
+          message: { content: "  My exact\nmessage  " },
+          ...extra,
+        }),
+      });
+    const human = project({ origin: { kind: "human" }, promptSource: "typed" });
+    expect(human.find((e) => e.type === "message.updated")?.payload).toMatchObject({
+      role: "user",
+      text: "  My exact\nmessage  ",
+    });
+    const sentMessage = human.find((e) => e.type === "message.updated")!.payload;
+    const echoed = projectAttachmentLine({
+      thread,
+      parent: null,
+      agentId: null,
+      ordinal: 2,
+      includeActivity: false,
+      sentMessage: { ...sentMessage, creationSource: "web" },
+      line: JSON.stringify({
+        ...record,
+        type: "user",
+        isMeta: true,
+        origin: { kind: "peer" },
+        message: { content: "Another Claude session sent a message: wrapped transport text" },
+      }),
+    });
+    expect(echoed.find((e) => e.type === "message.updated")?.payload).toMatchObject({
+      role: "user",
+      text: "  My exact\nmessage  ",
+      creationSource: "web",
+    });
+    for (const extra of [
+      { origin: { kind: "task-notification" }, promptSource: "system" },
+      { origin: { kind: "peer" }, isMeta: true },
+      { isCompactSummary: true, isVisibleInTranscriptOnly: true },
+      { isMeta: true },
+      { message: { content: "<command-name>/login</command-name>" } },
+    ]) {
+      const events = project(extra);
+      expect(events.every(isEvent)).toBe(true);
+      expect(events.find((e) => e.type === "message.updated")?.payload).toMatchObject({
+        role: "system",
+        createdBy: "system",
+      });
+      expect(events.find((e) => e.type === "turn-item.updated")?.payload.type).toBe(
+        "system_notice",
+      );
+    }
+  });
+  it("does not let old backfill mark agents running and treats stale unfinished tails as unknown idle", () => {
+    const input = {
+      thread,
+      parent: thread,
+      agentId: "child",
+      ordinal: 1,
+      line: JSON.stringify({ ...record, message: { content: "Working", stop_reason: "tool_use" } }),
+    };
+    expect(projectAttachmentLine({ ...input, includeActivity: false }).map((e) => e.type)).toEqual([
+      "message.updated",
+      "turn-item.updated",
+    ]);
+    const stale = projectAttachmentLine({ ...input, activityStatus: "idle" }).find(
+      (e) => e.type === "subagent.updated",
+    );
+    expect(stale?.payload).toMatchObject({
+      status: "idle",
+      result: null,
+      progress: "No recent activity; final outcome not recorded by Claude.",
+    });
+    const finished = projectAttachmentLine({
+      ...input,
+      activityStatus: "idle",
+      line: JSON.stringify({
+        ...record,
+        message: { content: "Done", stop_reason: "stop_sequence" },
+      }),
+    }).find((e) => e.type === "subagent.updated");
+    expect(finished?.payload).toMatchObject({ status: "completed", result: "Done" });
+    expect(finished?.payload.progress).toBeUndefined();
+  });
   it("does not expose another session or turn tool-result strings into user prompts", () => {
     const project = (value: unknown) =>
       projectAttachmentLine({

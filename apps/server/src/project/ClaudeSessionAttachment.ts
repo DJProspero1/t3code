@@ -5,6 +5,7 @@ import {
   ProviderInstanceId,
   ProviderThreadId,
   ThreadId,
+  MessageId,
   type OrchestrationV2ProviderThread,
   type OrchestrationV2Subagent,
   type ClaudeSessionAttachmentInput,
@@ -49,7 +50,7 @@ export class ClaudeSessionAttachment extends Context.Service<
       {
         threadId: ThreadId;
         attached: boolean;
-        readOnly: true;
+        readOnly: boolean;
       },
       ClaudeSessionAttachmentError
     >;
@@ -125,6 +126,7 @@ const make = Effect.gen(function* () {
           },
         );
         yield* sink.write({
+          skipExistingEventIds: true,
           events: [
             ...related.subagents.map((item) =>
               attachmentEvent(
@@ -191,6 +193,7 @@ const make = Effect.gen(function* () {
         configDirectory,
         transcriptPath: data.transcriptPath,
         attached: true,
+        projectionVersion: 2,
         state: "connecting",
       },
       lineage: {
@@ -236,6 +239,7 @@ const make = Effect.gen(function* () {
       updatedAt: now,
     };
     const committed = yield* sink.write({
+      skipExistingEventIds: true,
       ...(parent ? {} : { unlessNativeThreadOwned: binding }),
       events: [
         attachmentEvent(threadId, "thread.created", thread, now, threadId),
@@ -264,13 +268,15 @@ const make = Effect.gen(function* () {
       thread.deletedAt !== null ||
       (externalSession.state === state &&
         (!cursor ||
-          (cursor.offset === externalSession.cursor?.offset &&
+          (externalSession.projectionVersion === 2 &&
+            cursor.offset === externalSession.cursor?.offset &&
             cursor.identity === externalSession.cursor?.identity)) &&
         (!model || model === thread.modelSelection.model))
     )
       return;
     const now = yield* DateTime.now;
     yield* sink.write({
+      skipExistingEventIds: true,
       events: [
         attachmentEvent(
           threadId,
@@ -282,12 +288,12 @@ const make = Effect.gen(function* () {
               ...externalSession,
               attached: state !== "detached",
               state,
-              ...(cursor ? { cursor } : {}),
+              ...(cursor ? { cursor, projectionVersion: 2 } : {}),
             },
             updatedAt: now,
           },
           now,
-          `${state}:${DateTime.toEpochMillis(now)}`,
+          `${state}:${externalSession.state}:${externalSession.projectionVersion ?? 0}:2:${cursor?.identity ?? ""}:${cursor?.offset ?? -1}:${model ?? ""}:${DateTime.toEpochMillis(now)}`,
         ),
       ],
     });
@@ -299,7 +305,8 @@ const make = Effect.gen(function* () {
     agentId: string | null,
   ) {
     const external = thread.externalSession!;
-    const old = external.cursor ?? { offset: 0 };
+    const old =
+      external.projectionVersion === 2 ? (external.cursor ?? { offset: 0 }) : { offset: 0 };
     const read = yield* source.read(external.configDirectory, external.transcriptPath, old);
     let model: string | undefined;
     for (const line of read.lines) {
@@ -328,25 +335,79 @@ const make = Effect.gen(function* () {
         })).subagents[0]
       : undefined;
     let ordinal = old.offset;
-    const events = read.lines.flatMap((line) => {
-      ordinal += Buffer.byteLength(line) + 1;
-      const projected = projectAttachmentLine({
+    const events = (yield* Effect.forEach(
+      read.lines,
+      Effect.fnUntraced(function* (line) {
+        ordinal += Buffer.byteLength(line) + 1;
+        const details = attachmentDetails(line, external.sessionId);
+        const existingMessage =
+          details?.isPeer && details.uuid
+            ? (yield* projections.getThreadRecords(thread.id, ["messages"], {
+                messageIds: [
+                  MessageId.make(details.uuid),
+                  MessageId.make(`${thread.id}:${details.uuid}`),
+                ],
+              })).messages[0]
+            : undefined;
+        const projected = projectAttachmentLine({
+          sentMessage: existingMessage?.creationSource !== "provider" ? existingMessage : undefined,
+          thread,
+          parent,
+          agentId,
+          line,
+          ordinal,
+          previousSubagent,
+          includeActivity: false,
+        });
+        const child = projected.find((event) => event.type === "subagent.updated");
+        if (child?.type === "subagent.updated") previousSubagent = child.payload;
+        return projected;
+      }),
+    )).flat();
+    for (let i = 0; i < events.length; i += 100)
+      yield* sink.write({ skipExistingEventIds: true, events: events.slice(i, i + 100) });
+    yield* setState(thread.id, read.caughtUp ? "following" : "connecting", read.cursor, model);
+    return read.caughtUp;
+  });
+
+  const activitySnapshots = new Map<string, string>();
+  const refreshActivity = Effect.fn("ClaudeSessionAttachment.refreshActivity")(function* (
+    thread: OrchestrationV2AppThread,
+    parent: OrchestrationV2AppThread | null,
+    agentId: string | null,
+  ) {
+    const external = thread.externalSession!;
+    const tail = yield* source.tail(external.configDirectory, external.transcriptPath);
+    const now = yield* DateTime.now;
+    const activityStatus =
+      DateTime.toEpochMillis(now) - tail.modifiedAt < 120_000
+        ? ("running" as const)
+        : ("idle" as const);
+    const stamp = `${tail.size}:${tail.modifiedAt}:${activityStatus}:${thread.lineage.parentThreadId}`;
+    if (activitySnapshots.get(thread.id) === stamp) return;
+    const previousSubagent = parent
+      ? (yield* projections.getThreadRecords(parent.id, ["subagents"], {
+          subagentIds: [attachmentNodeId(thread.id)],
+        })).subagents[0]
+      : undefined;
+    for (const line of [...tail.lines].reverse()) {
+      const events = projectAttachmentLine({
         thread,
         parent,
         agentId,
         line,
-        ordinal,
+        ordinal: tail.size,
         previousSubagent,
-      });
-      const child = projected.find((event) => event.type === "subagent.updated");
-      if (child?.type === "subagent.updated") previousSubagent = child.payload;
-      return projected;
-    });
-    for (let i = 0; i < events.length; i += 100)
-      yield* sink.write({ events: events.slice(i, i + 100) });
-    yield* setState(thread.id, read.caughtUp ? "following" : "connecting", read.cursor, model);
+        activityStatus,
+        activityKey: stamp,
+      }).filter((event) => event.type === "node.updated" || event.type === "subagent.updated");
+      if (events.length) {
+        yield* sink.write({ skipExistingEventIds: true, events });
+        break;
+      }
+    }
+    activitySnapshots.set(thread.id, stamp);
   });
-
   const childOffsets = new Map<string, number>();
   const sync = Effect.gen(function* () {
     const rows = yield* sql<{ thread_id: string }>`
@@ -359,7 +420,12 @@ const make = Effect.gen(function* () {
       const thread = yield* projections.getThread(ThreadId.make(row.thread_id));
       const external = thread.externalSession!;
       yield* Effect.gen(function* () {
-        yield* followFile(thread, null, null);
+        // Prioritize root history, including one-time reclassification of older imports.
+        for (let pass = 0; pass < 8; pass++) {
+          const current = yield* projections.getThread(thread.id);
+          if (yield* followFile(current, null, null)) break;
+        }
+        yield* refreshActivity(thread, null, null);
         const children = yield* source.children(external.configDirectory, external.transcriptPath);
         // Bound each pass so a large agent tree cannot starve detach or other sessions.
         const start = childOffsets.get(thread.id) ?? 0;
@@ -368,7 +434,7 @@ const make = Effect.gen(function* () {
           (_, i) => children[(start + i) % children.length]!,
         );
         childOffsets.set(thread.id, children.length ? (start + batch.length) % children.length : 0);
-        for (const child of batch) {
+        for (const child of children) {
           yield* Effect.gen(function* () {
             const childThread = yield* create(thread, {
               sessionId: external.sessionId,
@@ -377,7 +443,8 @@ const make = Effect.gen(function* () {
               projectId: thread.projectId,
               agentId: child.agentId,
             });
-            yield* followFile(childThread, thread, child.agentId);
+            if (batch.includes(child)) yield* followFile(childThread, thread, child.agentId);
+            yield* refreshActivity(childThread, thread, child.agentId);
           }).pipe(Effect.catch(() => setState(thread.id, "unavailable")));
         }
       }).pipe(Effect.catch(() => setState(thread.id, "unavailable")));
@@ -412,7 +479,7 @@ const make = Effect.gen(function* () {
       const discovered = yield* source.discover(configDirectory, input.session);
       const thread = yield* create(null, { ...discovered, projectId: input.projectId });
       yield* setState(thread.id, "connecting");
-      return { threadId: thread.id, attached: true, readOnly: true as const };
+      return { threadId: thread.id, attached: true, readOnly: false };
     },
     gate.withPermit,
     Effect.mapError((cause) => new ClaudeSessionAttachmentError({ cause })),

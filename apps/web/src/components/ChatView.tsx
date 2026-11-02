@@ -1715,7 +1715,8 @@ export default function ChatView(props: ChatViewProps) {
   // Provider-native subagents cannot take messages; approvals and questions go to the top-level parent.
   const showProviderSubagentBar = isProviderSubagent;
   const externalSession = serverThread?.source.externalSession;
-  const composerMounted = !showProviderSubagentBar && !externalSession;
+  const composerMounted =
+    !showProviderSubagentBar && (!externalSession || externalSession.attached);
   const providerSubagentModels = selectedProviderEntry?.models ?? EMPTY_PROVIDER_MODELS;
   // Providers can report dated model ids or aliases.
   const providerSubagentModelSlug = selectedProviderEntry
@@ -3549,7 +3550,14 @@ export default function ChatView(props: ChatViewProps) {
                         aria-busy={queuedRunEdit.isSaving}
                       >
                         <div className="relative z-10">
-                          {externalSession ? (
+                          {externalSession?.attached && !showProviderSubagentBar && (
+                            <p className="px-5 py-2 text-xs text-muted-foreground">
+                              Prompts go to the running Claude session. Approvals and terminal
+                              controls remain in Claude Code.
+                            </p>
+                          )}
+                          {externalSession &&
+                          (!externalSession.attached || showProviderSubagentBar) ? (
                             <div
                               role={externalSession.state === "unavailable" ? "alert" : "status"}
                               className="px-5 py-3 text-sm text-muted-foreground"

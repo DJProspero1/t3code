@@ -1,4 +1,7 @@
-import { CommandId } from "@t3tools/contracts";
+import { sendClaudeMessage } from "../project/ClaudeSessionControl.ts";
+import * as EventSink from "./EventSink.ts";
+import { attachmentEvent } from "../project/claudeAttachmentProjection.ts";
+import { CommandId, TurnItemId } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
 import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
@@ -94,10 +97,90 @@ export const layerExecutor: Layer.Layer<
       yield* ThreadTitleRegenerationService.ThreadTitleRegenerationService;
     const threads = yield* ThreadManagementService.ThreadManagementService;
     const settings = yield* ServerSettings.ServerSettingsService;
+    const externalSink = yield* Effect.serviceOption(EventSink.EventSinkV2);
     return OrchestrationEffectExecutorV2.of({
       execute: Effect.fn("OrchestrationEffectExecutorV2.execute")(function (effect, options) {
         const willRetry = options?.willRetry ?? false;
         switch (effect.request.type) {
+          case "external-session.send": {
+            const request = effect.request;
+            return Effect.gen(function* () {
+              if (Option.isNone(externalSink))
+                return yield* new OrchestrationEffectExecutionError({
+                  effectId: effect.id,
+                  effectType: request.type,
+                });
+              const delivered =
+                effect.attemptCount <= 1 &&
+                (yield* sendClaudeMessage(request).pipe(
+                  Effect.match({ onSuccess: () => true, onFailure: () => false }),
+                ));
+              const now = yield* DateTime.now;
+              const item = {
+                ...request.item,
+                status: delivered ? ("completed" as const) : ("failed" as const),
+                title: delivered
+                  ? "Sent to Claude's live inbox"
+                  : "Delivery uncertain or failed. Check Claude before resending.",
+                updatedAt: now,
+                completedAt: delivered ? now : null,
+              };
+              yield* externalSink.value.write({
+                events: [
+                  attachmentEvent(
+                    effect.threadId,
+                    "turn-item.updated",
+                    item,
+                    now,
+                    `${effect.id}:delivery`,
+                  ),
+                  ...(!delivered
+                    ? [
+                        attachmentEvent(
+                          effect.threadId,
+                          "turn-item.updated",
+                          {
+                            id: TurnItemId.make(`${request.item.id}:delivery-error`),
+                            threadId: request.item.threadId,
+                            runId: null,
+                            nodeId: null,
+                            providerThreadId: null,
+                            providerTurnId: null,
+                            nativeItemRef: null,
+                            parentItemId: null,
+                            ordinal: request.item.ordinal,
+                            title: "Claude message delivery",
+                            startedAt: now,
+                            type: "error",
+                            status: "failed",
+                            updatedAt: now,
+                            completedAt: now,
+                            failure: {
+                              class: "transport_error",
+                              code: "claude_inbox_uncertain",
+                              retryable: false,
+                              message:
+                                "Delivery to Claude's live inbox failed or is uncertain. Check the original Claude session before resending; T3 will not retry automatically.",
+                            },
+                          },
+                          now,
+                          `${effect.id}:delivery-error`,
+                        ),
+                      ]
+                    : []),
+                ],
+              });
+            }).pipe(
+              Effect.mapError(
+                (cause) =>
+                  new OrchestrationEffectExecutionError({
+                    effectId: effect.id,
+                    effectType: request.type,
+                    cause,
+                  }),
+              ),
+            );
+          }
           case "provider-runtime.continue": {
             const sourceRunId = effect.request.sourceRunId;
             return continueRestartedRun({ threadId: effect.threadId, sourceRunId }).pipe(

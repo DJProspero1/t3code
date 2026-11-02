@@ -87,3 +87,17 @@ it.effect("rejects transcripts symlinked outside Claude projects", () =>
     );
   }).pipe(Effect.provide(Source.layer)),
 );
+
+it.effect("reads the current tail independently of a historical cursor", () =>
+  Effect.gen(function* () {
+    const f = yield* fixture;
+    const source = yield* Source.ClaudeAttachmentSource;
+    const latest = JSON.stringify({ type: "assistant", message: { stop_reason: "end_turn" } });
+    yield* Effect.promise(() => NodeFSP.writeFile(f.file, "{}\n".repeat(200000) + latest + "\n"));
+    const history = yield* source.read(f.home, f.file, { offset: 0 });
+    expect(history.caughtUp).toBe(false);
+    expect((yield* source.tail(f.home, f.file)).lines.at(-1)).toBe(latest);
+    yield* Effect.promise(() => NodeFSP.appendFile(f.file, "{}\n"));
+    expect((yield* source.tail(f.home, f.file)).lines.at(-1)).toBe("{}");
+  }).pipe(Effect.provide(Source.layer)),
+);

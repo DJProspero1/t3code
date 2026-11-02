@@ -8,6 +8,8 @@ import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
 
 const Session = Schema.Struct({
+  procStart: Schema.optional(Schema.String),
+  messagingSocketPath: Schema.optional(Schema.String),
   pid: Schema.Int,
   sessionId: Schema.String,
   cwd: Schema.String,
@@ -39,6 +41,13 @@ export interface TranscriptCursor {
 export class ClaudeAttachmentSource extends Context.Service<
   ClaudeAttachmentSource,
   {
+    readonly tail: (
+      home: string,
+      path: string,
+    ) => Effect.Effect<
+      { lines: ReadonlyArray<string>; size: number; modifiedAt: number },
+      ClaudeAttachmentSourceError
+    >;
     readonly discover: (
       home: string,
       query: string,
@@ -88,9 +97,48 @@ async function checkedPath(home: string, file: string) {
   return actual;
 }
 
+const tailCache = new Map<
+  string,
+  { stamp: string; result: { lines: string[]; size: number; modifiedAt: number } }
+>();
+
 export const layer = Layer.succeed(
   ClaudeAttachmentSource,
   ClaudeAttachmentSource.of({
+    tail: Effect.fn("ClaudeAttachmentSource.tail")((home, path) =>
+      Effect.tryPromise({
+        try: async () => {
+          const actual = await checkedPath(home, path);
+          const file = await NodeFSP.open(actual, "r");
+          try {
+            const stat = await file.stat();
+            const stamp = `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeMs}`;
+            const cached = tailCache.get(actual);
+            if (cached?.stamp === stamp) return cached.result;
+            const offset = Math.max(0, stat.size - 256 * 1024);
+            const buffer = Buffer.alloc(stat.size - offset);
+            const { bytesRead } = await file.read(buffer, 0, buffer.length, offset);
+            const complete = buffer.subarray(0, bytesRead);
+            const end = complete.lastIndexOf(10);
+            const start = offset ? complete.indexOf(10) + 1 : 0;
+            const result = {
+              lines:
+                end >= start
+                  ? complete.subarray(start, end).toString("utf8").split("\n").slice(-64)
+                  : [],
+              size: stat.size,
+              modifiedAt: stat.mtimeMs,
+            };
+            if (tailCache.size >= 2048) tailCache.clear();
+            tailCache.set(actual, { stamp, result });
+            return result;
+          } finally {
+            await file.close();
+          }
+        },
+        catch: (cause) => new ClaudeAttachmentSourceError({ operation: "read", cause }),
+      }),
+    ),
     discover: Effect.fn("ClaudeAttachmentSource.discover")((home, query) =>
       Effect.tryPromise({
         try: async () => {

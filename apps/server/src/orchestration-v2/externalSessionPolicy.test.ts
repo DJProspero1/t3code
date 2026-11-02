@@ -40,7 +40,7 @@ const layer = Harness.layerWithRegistry(
   { runEffectWorker: false },
 );
 
-it.effect("rejects a new prompt at the orchestrator before a run can be created", () =>
+it.effect("queues a prompt for the existing Claude inbox without creating a provider run", () =>
   Effect.gen(function* () {
     const orchestrator = yield* Orchestrator.OrchestratorV2;
 
@@ -85,21 +85,23 @@ it.effect("rejects a new prompt at the orchestrator before a run can be created"
         },
       ],
     });
-    const error = yield* orchestrator
-      .dispatch({
-        type: "message.dispatch",
-        dispatchMode: { type: "start_immediately" },
-        commandId: CommandId.make("cannot-send"),
-        threadId,
-        messageId: MessageId.make("cannot-send"),
-        text: "Do work",
-        attachments: [],
-        modelSelection,
-        createdBy: "user",
-        creationSource: "web",
-      })
-      .pipe(Effect.flip);
-    expect(error.message).toContain("external Claude");
+    const result = yield* orchestrator.dispatch({
+      type: "message.dispatch",
+      dispatchMode: { type: "start_immediately" },
+      commandId: CommandId.make("cannot-send"),
+      threadId,
+      messageId: MessageId.make("cannot-send"),
+      text: "Do work",
+      attachments: [],
+      modelSelection,
+      createdBy: "user",
+      creationSource: "web",
+    });
+    expect(result.sequence).toBeGreaterThan(0);
+    expect((yield* orchestrator.getThreadRecords(threadId, ["messages"])).messages).toHaveLength(1);
+    expect((yield* orchestrator.getThreadRecords(threadId, ["messages"])).messages[0]?.id).toBe(
+      "cannot-send",
+    );
     expect((yield* orchestrator.getThreadRecords(threadId, ["runs"])).runs).toHaveLength(0);
   }).pipe(Effect.provide(layer)),
 );

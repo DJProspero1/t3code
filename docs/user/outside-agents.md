@@ -135,11 +135,20 @@ working directory can be missing. The command prints the thread link. History
 loads in the background; newly created subagents are discovered automatically.
 Closing a T3 client does not stop syncing. The server resumes syncing after a restart.
 
-This is a read-only view of transcript messages and subagent progress. Keep
-sending messages and answering permissions in Claude Code. T3 does not resume the
-session, run another Claude process, or take over its agents. Updates appear when
-Claude writes its transcript, rather than token by token. Tool output and pending
-permission dialogs are not mirrored in this first attachment mode.
+On Linux, send text prompts from the attached root thread to the existing Claude
+session. Claude reads them through its local inbox between tool calls. T3 does not
+start another Claude process. Files, slash commands, permissions, model changes,
+and direct subagent controls still require Claude Code; the inbox does not expose
+those operations. A failed or uncertain send is not retried automatically.
+
+Your messages retain their original wording. Claude task notifications, peer messages,
+and context summaries are classified as system activity, not as messages you sent.
+Older imports are repaired in the background after an upgrade.
+
+History loads separately from current activity. Completed subagents are shown as
+completed even while their older messages are still importing. A child with no
+recent activity and no recorded final outcome is shown as idle, not assumed to be
+running. Tool output and pending permission dialogs are not mirrored.
 
 To stop syncing while keeping the imported history:
 

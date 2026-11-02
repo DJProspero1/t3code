@@ -8,6 +8,7 @@ import {
   ThreadId,
   TurnItemId,
   type OrchestrationV2AppThread,
+  type OrchestrationV2ConversationMessage,
   type OrchestrationV2DomainEvent,
   type OrchestrationV2Subagent,
 } from "@t3tools/contracts";
@@ -20,6 +21,11 @@ const Record = Schema.Struct({
   uuid: Schema.optional(Schema.String),
   timestamp: Schema.optional(Schema.String),
   sessionId: Schema.optional(Schema.String),
+  isMeta: Schema.optional(Schema.Boolean),
+  isCompactSummary: Schema.optional(Schema.Boolean),
+  isVisibleInTranscriptOnly: Schema.optional(Schema.Boolean),
+  promptSource: Schema.optional(Schema.String),
+  origin: Schema.optional(Schema.Struct({ kind: Schema.String })),
   toolUseResult: Schema.optional(Schema.Unknown),
   message: Schema.optional(
     Schema.Struct({
@@ -52,7 +58,12 @@ export function attachmentDetails(line: string, sessionId: string) {
   const record = decodeRecord(line);
   if (Option.isNone(record) || record.value.sessionId !== sessionId) return null;
   const spawn = decodeSpawn(record.value.toolUseResult);
-  return { model: record.value.message?.model, spawn: Option.getOrNull(spawn) };
+  return {
+    uuid: record.value.uuid,
+    isPeer: record.value.origin?.kind === "peer",
+    model: record.value.message?.model,
+    spawn: Option.getOrNull(spawn),
+  };
 }
 
 const attachmentKey = (...parts: ReadonlyArray<string>) =>
@@ -84,6 +95,11 @@ export function projectAttachmentLine(input: {
   agentId: string | null;
   line: string;
   ordinal: number;
+  includeActivity?: boolean;
+  activityStatus?: "idle" | "running";
+  activityKey?: string;
+  messageId?: MessageId;
+  sentMessage?: OrchestrationV2ConversationMessage | undefined;
   previousSubagent?: OrchestrationV2Subagent | undefined;
 }): ReadonlyArray<OrchestrationV2DomainEvent> {
   const decoded = decodeRecord(input.line);
@@ -102,18 +118,45 @@ export function projectAttachmentLine(input: {
   const at = parsedAt.value;
   const { thread, parent } = input;
   const content = record.message.content;
-  const text =
+  const rawText =
     typeof content === "string"
       ? content
       : (content ?? [])
           .filter((block) => block.type === "text")
           .map((block) => block.text ?? "")
           .join("\n");
+  const text = input.sentMessage?.text ?? rawText;
+  // Claude stores harness traffic using the user API role. Provenance, not API role,
+  // determines whether it belongs in a human chat bubble. Never rewrite human text.
+  const internal =
+    record.type === "user" &&
+    !input.sentMessage &&
+    (record.isMeta ||
+      record.isCompactSummary ||
+      record.isVisibleInTranscriptOnly ||
+      record.promptSource === "system" ||
+      (record.origin !== undefined && record.origin.kind !== "human") ||
+      (record.origin === undefined &&
+        /^(?:<task-notification>|<command-name>|<local-command-|\[Request interrupted by user)/.test(
+          text,
+        )));
+  const internalTitle = record.isCompactSummary
+    ? "Claude context summary"
+    : record.origin?.kind === "peer"
+      ? "Claude agent message"
+      : record.origin?.kind === "task-notification" || text.startsWith("<task-notification>")
+        ? "Claude task notification"
+        : "Claude internal event";
   const events: Array<OrchestrationV2DomainEvent> = [];
-  const key = attachmentKey(record.uuid, input.line);
+  const key = attachmentKey("projection-v2", record.uuid, input.line);
   if (text) {
-    const messageId = MessageId.make(`${thread.id}:${record.uuid}`);
-    const role = record.type === "user" ? ("user" as const) : ("assistant" as const);
+    const messageId =
+      input.sentMessage?.id ?? input.messageId ?? MessageId.make(`${thread.id}:${record.uuid}`);
+    const role = internal
+      ? ("system" as const)
+      : record.type === "user"
+        ? ("user" as const)
+        : ("assistant" as const);
     const message = {
       id: messageId,
       threadId: thread.id,
@@ -125,8 +168,10 @@ export function projectAttachmentLine(input: {
       streaming: false,
       createdAt: at,
       updatedAt: at,
-      createdBy: role === "user" ? ("user" as const) : ("agent" as const),
-      creationSource: "provider" as const,
+      createdBy:
+        input.sentMessage?.createdBy ??
+        (internal ? ("system" as const) : role === "user" ? ("user" as const) : ("agent" as const)),
+      creationSource: input.sentMessage?.creationSource ?? ("provider" as const),
     };
     events.push(attachmentEvent(thread.id, "message.updated", message, at, key));
     const common = {
@@ -151,24 +196,30 @@ export function projectAttachmentLine(input: {
       attachmentEvent(
         thread.id,
         "turn-item.updated",
-        role === "user"
-          ? {
-              ...common,
-              type: "user_message",
-              createdBy: "user",
-              creationSource: "provider",
-              inputIntent: "turn_start",
-              attachments: [],
-            }
-          : { ...common, type: "assistant_message", streaming: false },
+        internal
+          ? { ...common, type: "system_notice", title: internalTitle, message: internalTitle }
+          : role === "user"
+            ? {
+                ...common,
+                type: "user_message",
+                createdBy: message.createdBy,
+                creationSource: message.creationSource,
+                inputIntent: "turn_start",
+                attachments: [],
+              }
+            : { ...common, type: "assistant_message", streaming: false },
         at,
         key,
       ),
     );
   }
+  if (input.includeActivity === false) return events;
+  const activityKey = `${key}:activity-v2:${input.activityKey ?? "history"}`;
   {
     const ownNodeId = parent ? NodeId.make(`${thread.id}:root`) : attachmentNodeId(thread.id);
-    const completed = record.type === "assistant" && record.message.stop_reason === "end_turn";
+    const completed =
+      record.type === "assistant" &&
+      ["end_turn", "stop_sequence"].includes(record.message.stop_reason ?? "");
     events.push(
       attachmentEvent(
         thread.id,
@@ -180,7 +231,7 @@ export function projectAttachmentLine(input: {
           parentNodeId: null,
           rootNodeId: ownNodeId,
           kind: "root_turn",
-          status: completed ? "completed" : "running",
+          status: completed ? "completed" : (input.activityStatus ?? "running"),
           countsForRun: false,
           providerThreadId: thread.activeProviderThreadId,
           providerTurnId: null,
@@ -191,12 +242,14 @@ export function projectAttachmentLine(input: {
           completedAt: completed ? at : null,
         },
         at,
-        key,
+        activityKey,
       ),
     );
   }
   if (parent && input.agentId) {
-    const completed = record.type === "assistant" && record.message.stop_reason === "end_turn";
+    const completed =
+      record.type === "assistant" &&
+      ["end_turn", "stop_sequence"].includes(record.message.stop_reason ?? "");
     const subagent: OrchestrationV2Subagent = {
       id: attachmentNodeId(thread.id),
       threadId: parent.id,
@@ -215,14 +268,17 @@ export function projectAttachmentLine(input: {
       },
       prompt: input.previousSubagent?.prompt || (record.type === "user" ? text : ""),
       title: thread.title,
+      ...(!completed && input.activityStatus === "idle"
+        ? { progress: "No recent activity; final outcome not recorded by Claude." }
+        : {}),
       model: record.message.model ?? thread.modelSelection.model,
-      status: completed ? "completed" : "running",
+      status: completed ? "completed" : (input.activityStatus ?? "running"),
       result: completed ? text : null,
       startedAt: input.previousSubagent?.startedAt ?? at,
       completedAt: completed ? at : null,
       updatedAt: at,
     };
-    events.push(attachmentEvent(parent.id, "subagent.updated", subagent, at, key));
+    events.push(attachmentEvent(parent.id, "subagent.updated", subagent, at, activityKey));
     events.push(
       attachmentEvent(
         parent.id,
@@ -245,7 +301,7 @@ export function projectAttachmentLine(input: {
           completedAt: subagent.completedAt,
         },
         at,
-        key,
+        activityKey,
       ),
     );
   }

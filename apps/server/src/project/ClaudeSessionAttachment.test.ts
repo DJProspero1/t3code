@@ -2,6 +2,7 @@ import { expect, it } from "@effect/vitest";
 import { ProjectId } from "@t3tools/contracts";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import * as Context from "effect/Context";
+import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Path from "effect/Path";
@@ -14,7 +15,11 @@ import { ServerActivation } from "../serverActivation.ts";
 import * as Source from "./ClaudeAttachmentSource.ts";
 import * as Attachment from "./ClaudeSessionAttachment.ts";
 import * as Project from "./ProjectService.ts";
-import { attachmentNodeId, attachmentThreadId } from "./claudeAttachmentProjection.ts";
+import {
+  attachmentEvent,
+  attachmentNodeId,
+  attachmentThreadId,
+} from "./claudeAttachmentProjection.ts";
 
 const stores = Layer.mergeAll(EventStore.layer, ProjectionStore.layer).pipe(
   Layer.provideMerge(Sqlite.layerMemory),
@@ -59,6 +64,12 @@ it.effect(
               .filter((path) => path !== rootPath)
               .map((path) => ({ path, agentId: path.split("/").at(-1)!.slice(6, -6) })),
           ),
+        tail: (_home, path) =>
+          Effect.sync(() => ({
+            lines: files.get(path) ?? [],
+            size: (files.get(path) ?? []).join("\n").length,
+            modifiedAt: 1,
+          })),
         read: (_home, path, cursor) =>
           Effect.sync(() => {
             const lines = files.get(path) ?? [];
@@ -154,6 +165,38 @@ it.effect(
       const restarted = Context.get(restartedContext, Attachment.ClaudeSessionAttachment);
       yield* restarted.sync;
       expect(yield* count()).toEqual(before);
+      expect((yield* projection.getThread(attached.threadId)).externalSession?.state).toBe(
+        "following",
+      );
+      // An upgrade must correct already-imported bubbles, not just future records.
+      const prior = yield* projection.getThread(attached.threadId);
+      const at = yield* DateTime.now;
+      yield* (yield* EventSink.EventSinkV2).write({
+        events: [
+          attachmentEvent(
+            prior.id,
+            "thread.metadata-updated",
+            { ...prior, externalSession: { ...prior.externalSession!, projectionVersion: 1 } },
+            at,
+            "old-projection",
+          ),
+        ],
+      });
+      files.set(rootPath, [
+        JSON.stringify({
+          type: "user",
+          uuid: "prompt",
+          sessionId: "session",
+          timestamp: "2026-01-01T00:00:00Z",
+          isMeta: true,
+          message: { content: "Internal context" },
+        }),
+      ]);
+      yield* restarted.sync;
+      expect((yield* projection.getThreadRecords(prior.id, ["messages"])).messages[0]?.role).toBe(
+        "system",
+      );
+      expect((yield* projection.getThread(prior.id)).externalSession?.projectionVersion).toBe(2);
       yield* restarted.change({ action: "detach", threadId: attached.threadId });
       expect(
         (yield* projection.getThread(attachmentThreadId("/claude", "session", "child-two")))

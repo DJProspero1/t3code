@@ -1704,7 +1704,13 @@ function ThreadDetailBody(
                 </View>
 
                 <View style={composerSlotHidden ? { display: "none" } : undefined}>
-                  {externalSession ? (
+                  {externalSession?.attached && !isProviderSubagent && (
+                    <Text className="px-3 py-2 text-xs text-foreground-muted">
+                      Prompts go to the running Claude session. Approvals and terminal controls
+                      remain in Claude Code.
+                    </Text>
+                  )}
+                  {externalSession && (!externalSession.attached || isProviderSubagent) ? (
                     <View className="px-3 py-3" accessibilityLiveRegion="polite">
                       <Text className="text-sm text-foreground-muted">
                         {externalSessionStatusText(externalSession)}

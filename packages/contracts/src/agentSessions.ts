@@ -72,7 +72,7 @@ export type ClaudeSessionAttachmentInput = typeof ClaudeSessionAttachmentInput.T
 export const ClaudeSessionAttachmentResult = Schema.Struct({
   threadId: ThreadId,
   attached: Schema.Boolean,
-  readOnly: Schema.Literal(true),
+  readOnly: Schema.Boolean,
   link: Schema.optional(Schema.String),
 });
 

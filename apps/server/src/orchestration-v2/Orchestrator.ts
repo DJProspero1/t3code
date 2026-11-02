@@ -1,3 +1,4 @@
+import { projectAttachmentLine } from "../project/claudeAttachmentProjection.ts";
 import { canMutateExternalSession } from "./externalSessionPolicy.ts";
 import type {
   GuestShareId,
@@ -348,7 +349,7 @@ export class ExternalSessionReadOnlyError extends Schema.TaggedError<ExternalSes
   { threadId: ThreadId },
 ) {
   override get message() {
-    return "This thread follows an external Claude session. Send messages and manage agents in Claude Code; T3 will follow their progress.";
+    return "This control is not exposed by Claude's live inbox. Send text prompts from the attached root thread; use Claude Code for approvals, model changes and direct agent controls.";
   }
 }
 
@@ -618,6 +619,8 @@ function commandThreadId(command: OrchestrationV2ServerCommand): ThreadId {
 }
 
 // Validate before resolving the request: adapters may otherwise coerce unusable answers.
+const encodeExternalRecord = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
+
 const decodeUserInputAnswers = Schema.decodeUnknownEffect(
   Schema.Record(
     Schema.String,
@@ -12975,7 +12978,11 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       "orchestration_v2.thread_id": commandThreadId(command),
     });
 
-    if (command.type !== "thread.create" && !canMutateExternalSession(command.type)) {
+    if (
+      command.type !== "thread.create" &&
+      command.type !== "message.dispatch" &&
+      !canMutateExternalSession(command.type)
+    ) {
       const target = yield* projectionStore.getThread(commandThreadId(command)).pipe(
         Effect.catchTags({ ProjectionStoreThreadNotFoundError: () => Effect.succeed(null) }),
         Effect.mapError(
@@ -13144,6 +13151,91 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
               (cause) => new OrchestratorProjectionError({ threadId: command.threadId, cause }),
             ),
           );
+        if (thread.externalSession) {
+          const external = thread.externalSession;
+          if (
+            !external.attached ||
+            thread.lineage.parentThreadId !== null ||
+            command.attachments.length > 0 ||
+            command.text.trimStart().startsWith("/")
+          ) {
+            return yield* new OrchestratorDispatchError({
+              commandId: command.commandId,
+              commandType: command.type,
+              cause:
+                "Attached sessions accept text prompts on the root thread. Files, slash commands, approvals and direct subagent controls are not exposed by Claude's live inbox.",
+            });
+          }
+          const now = yield* DateTime.now;
+          const projected = projectAttachmentLine({
+            messageId: command.messageId,
+            thread,
+            parent: null,
+            agentId: null,
+            ordinal: DateTime.toEpochMillis(now),
+            includeActivity: false,
+            line: encodeExternalRecord({
+              type: "user",
+              uuid: command.messageId,
+              sessionId: external.sessionId,
+              timestamp: DateTime.formatIso(now),
+              message: { content: command.text },
+            }),
+          });
+          const itemEvent = projected.find((event) => event.type === "turn-item.updated");
+          if (!itemEvent || itemEvent.type !== "turn-item.updated")
+            return yield* new OrchestratorDispatchError({
+              commandId: command.commandId,
+              commandType: command.type,
+              cause: "Empty external message",
+            });
+          const item = {
+            ...itemEvent.payload,
+            status: "pending" as const,
+            completedAt: null,
+            title: "Sending to Claude's live inbox",
+            ...(itemEvent.payload.type === "user_message"
+              ? {
+                  createdBy: command.createdBy ?? "user",
+                  creationSource: command.creationSource ?? "web",
+                }
+              : {}),
+          };
+          yield* Ref.update(events, (existing) => [
+            ...existing,
+            ...projected.map((event) =>
+              event.type === "turn-item.updated"
+                ? { ...event, payload: item }
+                : event.type === "message.updated"
+                  ? {
+                      ...event,
+                      payload: {
+                        ...event.payload,
+                        createdBy: command.createdBy ?? "user",
+                        creationSource: command.creationSource ?? "web",
+                      },
+                    }
+                  : event,
+            ),
+          ]);
+          yield* Ref.update(effects, (existing) => [
+            ...existing,
+            {
+              id: `effect:${command.commandId}:external-session.send`,
+              commandId: command.commandId,
+              threadId: thread.id,
+              request: {
+                type: "external-session.send" as const,
+                configDirectory: external.configDirectory,
+                sessionId: external.sessionId,
+                uuid: command.messageId,
+                text: command.text,
+                item,
+              },
+            },
+          ]);
+          break;
+        }
         if (isProviderNativeSubagentThread(thread)) {
           return yield* new OrchestratorSubagentThreadReadOnlyError({
             commandId: command.commandId,

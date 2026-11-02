@@ -462,6 +462,7 @@ export const OrchestrationV2AppThread = Schema.Struct({
       configDirectory: Schema.String,
       transcriptPath: Schema.String,
       attached: Schema.Boolean,
+      projectionVersion: Schema.optional(Schema.Number),
       cursor: Schema.optional(
         Schema.Struct({ offset: Schema.Number, identity: Schema.optional(Schema.String) }),
       ),

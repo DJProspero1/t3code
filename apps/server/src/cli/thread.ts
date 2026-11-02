@@ -692,7 +692,7 @@ const threadSendCommand = Command.make("send", {
             { threadId, message, mode: "queue" },
             OrchestratorMcpThreadSendResult,
           );
-          if (flags.wait) {
+          if (flags.wait && sent.runId !== null) {
             return yield* finishRun(tools, { threadId, runId: sent.runId, json: flags.json });
           }
           yield* flags.json
@@ -780,7 +780,7 @@ const threadAttachCommand = Command.make("attach", {
         yield* flags.json
           ? printJson(result)
           : Console.log(
-              `Following Claude in ${result.link ?? result.threadId}. Read-only; Claude keeps running. Detach with: t3 thread detach ${result.threadId}`,
+              `Following Claude in ${result.link ?? result.threadId}. Prompts go to the running Claude session. Detach with: t3 thread detach ${result.threadId}`,
             );
       }),
     ).pipe(reportThreadErrors),

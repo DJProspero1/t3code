@@ -24,9 +24,9 @@ export function externalSessionStatusText(
 ): string {
   switch (session.state) {
     case "connecting":
-      return "Loading Claude history and subagents. Claude keeps running. This view is read-only.";
+      return "Loading Claude history and subagents. Prompts go to the running Claude session.";
     case "following":
-      return "Following Claude and its subagents. Send messages and answer approvals in Claude Code.";
+      return "Following Claude and its subagents. Prompts go to Claude; approvals and terminal controls remain in Claude Code.";
     case "unavailable":
       return "Claude history is temporarily unavailable. Retrying automatically; the last synced history is shown.";
     case "detached":

@@ -11,6 +11,7 @@ import {
   RunId,
   RuntimeRequestId,
   ThreadId,
+  TurnItemId,
   VcsProcessExitError,
 } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
@@ -24,6 +25,7 @@ import * as Ref from "effect/Ref";
 
 import * as CheckpointRollbackService from "./CheckpointRollbackService.ts";
 import * as CheckpointService from "./CheckpointService.ts";
+import * as EventSink from "./EventSink.ts";
 import * as EffectOutbox from "./EffectOutbox.ts";
 import * as EffectWorker from "./EffectWorker.ts";
 import * as RunFinalizationService from "./RunFinalizationService.ts";
@@ -78,6 +80,7 @@ function restartEffect(
 
 function layerExecutorFor(input: {
   readonly events: Ref.Ref<ReadonlyArray<string>>;
+  readonly sink?: EventSink.EventSinkV2["Service"]["write"];
   readonly failFirstStart?: Ref.Ref<boolean>;
   readonly threads?: Partial<ThreadManagementService.ThreadManagementService["Service"]>;
   readonly continueAfterRestart?: boolean;
@@ -160,6 +163,7 @@ function layerExecutorFor(input: {
     Layer.provide(
       Layer.mergeAll(
         layerDependencies,
+        Layer.mock(EventSink.EventSinkV2)(input.sink ? { write: input.sink } : {}),
         Layer.mock(ThreadManagementService.ThreadManagementService)(input.threads ?? {}),
         ServerSettings.layerTest(
           input.continueAfterRestart === true ? { continueThreadsAfterServerUpdate: true } : {},
@@ -634,4 +638,56 @@ it.effect.each(["confirmed", "unconfirmed", "failed"] as const)(
         outcome === "confirmed" ? ["stop-child", "settle-child"] : ["stop-child"],
       );
     }),
+);
+
+it.effect("never resends a live Claude inbox effect after a worker restart", () =>
+  Effect.gen(function* () {
+    const events = yield* Ref.make<ReadonlyArray<string>>([]);
+    const now = yield* DateTime.now;
+    const executor = yield* EffectWorker.OrchestrationEffectExecutorV2.pipe(
+      Effect.provide(
+        layerExecutorFor({
+          events,
+          sink: (input) =>
+            Effect.gen(function* () {
+              for (const event of input.events)
+                if (event.type === "turn-item.updated")
+                  yield* Ref.update(events, (entries) => [...entries, event.payload.status]);
+              return [];
+            }),
+        }),
+      ),
+    );
+    const base = restartEffect(now, { type: "detach" });
+    yield* executor.execute({
+      ...base,
+      attemptCount: 2,
+      request: {
+        type: "external-session.send",
+        configDirectory: "/must-not-read",
+        sessionId: "session",
+        uuid: "message",
+        text: "Do not send again",
+        item: {
+          id: TurnItemId.make("item"),
+          threadId,
+          runId: null,
+          nodeId: null,
+          providerThreadId: null,
+          providerTurnId: null,
+          nativeItemRef: null,
+          parentItemId: null,
+          ordinal: 1,
+          status: "pending",
+          title: null,
+          startedAt: now,
+          completedAt: null,
+          updatedAt: now,
+          type: "system_notice",
+          message: "fixture",
+        },
+      },
+    });
+    assert.deepEqual(yield* Ref.get(events), ["failed", "failed"]);
+  }),
 );

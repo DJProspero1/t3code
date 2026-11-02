@@ -3076,6 +3076,41 @@ const make = Effect.gen(function* () {
         requestKey: key,
         operation: "thread-send",
       });
+      if (target.thread.externalSession) {
+        if (mode === "restart" || mode === "steer")
+          return yield* failure(
+            "invalid_request",
+            "The live Claude inbox queues text prompts; restart and interrupt controls are unavailable.",
+          );
+        yield* threadManagement
+          .dispatch({
+            type: "message.dispatch",
+            commandId: stableCommandId({ scope, requestKey: key, operation: "thread-send" }),
+            threadId: input.threadId,
+            messageId,
+            text: input.message,
+            attachments: [],
+            dispatchMode: { type: "start_immediately" },
+            createdBy: "agent",
+            creationSource: "mcp",
+          })
+          .pipe(
+            Effect.mapError((error) =>
+              failure(
+                "orchestration_error",
+                userFacingDispatchErrorMessage(error) ?? errorMessage(error),
+              ),
+            ),
+          );
+        return {
+          threadId: input.threadId,
+          link: threadLinkFor(scope, input.threadId),
+          messageId,
+          runId: null,
+          status: "queued" as const,
+          delivery: "queued" as const,
+        };
+      }
       const result = yield* threadManagement
         .sendToThread({
           projectId: target.thread.projectId,

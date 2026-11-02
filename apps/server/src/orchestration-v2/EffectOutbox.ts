@@ -1,4 +1,5 @@
 import {
+  OrchestrationV2TurnItem,
   CheckpointId,
   CheckpointScopeId,
   CommandId,
@@ -30,6 +31,14 @@ import * as SqlClient from "effect/sql/SqlClient";
 import { forkParked } from "../serverActivation.ts";
 
 export const OrchestrationEffectRequestV2 = Schema.Union([
+  Schema.Struct({
+    type: Schema.Literal("external-session.send"),
+    configDirectory: Schema.String,
+    sessionId: Schema.String,
+    uuid: Schema.String,
+    text: Schema.String,
+    item: OrchestrationV2TurnItem,
+  }),
   Schema.Struct({
     type: Schema.Literal("provider-runtime.continue"),
     sourceRunId: RunId,
