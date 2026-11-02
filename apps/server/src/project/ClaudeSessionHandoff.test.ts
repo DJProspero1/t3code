@@ -40,6 +40,7 @@ it.effect(
         [child, [record("child-final")]],
       ]);
       const source = Layer.mock(Source.ClaudeAttachmentSource)({
+        aliases: () => Effect.succeed([]),
         discover: () =>
           Effect.succeed({ sessionId: "session", title: "Session", transcriptPath: root }),
         assertStopped: () =>
