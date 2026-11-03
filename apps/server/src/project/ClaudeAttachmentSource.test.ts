@@ -95,6 +95,19 @@ it.effect("waits for complete UTF-8 records and restarts after file replacement"
   }).pipe(Effect.provide(Source.layer)),
 );
 
+it.effect("preserves large tool records without skipping the next record", () =>
+  Effect.gen(function* () {
+    const f = yield* fixture;
+    const source = yield* Source.ClaudeAttachmentSource;
+    const line = JSON.stringify({ text: "x".repeat(26 * 1024 * 1024) });
+    yield* Effect.promise(() => NodeFSP.writeFile(f.file, line + '\n{"next":true}\n'));
+    const read = yield* source.read(f.home, f.file, { offset: 0 });
+    expect(read.lines).toEqual([line, '{"next":true}']);
+    expect(read.caughtUp).toBe(true);
+    expect((yield* source.read(f.home, f.file, read.cursor)).lines).toEqual([]);
+  }).pipe(Effect.provide(Source.layer)),
+);
+
 it.effect("rejects transcripts symlinked outside Claude projects", () =>
   Effect.gen(function* () {
     const f = yield* fixture;

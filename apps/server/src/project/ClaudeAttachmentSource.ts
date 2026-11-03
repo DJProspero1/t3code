@@ -37,7 +37,7 @@ const decodeSession = Schema.decodeUnknownSync(Schema.fromJsonString(Session));
 const uuid = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i;
 const agentFile = /^agent-([a-zA-Z0-9_-]+)\.jsonl$/;
 const CHUNK_BYTES = 512 * 1024;
-const MAX_LINE_BYTES = 8 * 1024 * 1024;
+const MAX_LINE_BYTES = 64 * 1024 * 1024;
 
 export class ClaudeAttachmentSourceError extends Schema.TaggedError<ClaudeAttachmentSourceError>()(
   "ClaudeAttachmentSourceError",
@@ -426,15 +426,19 @@ export const layer = Layer.sync(ClaudeAttachmentSource, () => {
             let offset =
               cursor.identity === identity && cursor.offset <= stat.size ? cursor.offset : 0;
             const buffer = Buffer.alloc(Math.min(CHUNK_BYTES, Math.max(0, stat.size - offset)));
-            let data = Buffer.alloc(0);
-            while (offset + data.length < stat.size) {
-              const { bytesRead } = await file.read(buffer, 0, buffer.length, offset + data.length);
+            const chunks: Buffer[] = [];
+            let length = 0;
+            while (offset + length < stat.size) {
+              const { bytesRead } = await file.read(buffer, 0, buffer.length, offset + length);
               if (bytesRead === 0) break;
-              data = Buffer.concat([data, buffer.subarray(0, bytesRead)]);
-              if (data.includes(10)) break;
-              if (data.length >= MAX_LINE_BYTES)
+              const chunk = Buffer.from(buffer.subarray(0, bytesRead));
+              chunks.push(chunk);
+              length += bytesRead;
+              if (chunk.includes(10)) break;
+              if (length >= MAX_LINE_BYTES)
                 throw new Error("Transcript line exceeds the size limit");
             }
+            const data = Buffer.concat(chunks, length);
             const end = data.lastIndexOf(10);
             if (end < 0) return { cursor: { offset, identity }, lines: [], caughtUp: true };
             const lines = data.subarray(0, end).toString("utf8").split("\n");
