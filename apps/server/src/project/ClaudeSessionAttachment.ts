@@ -775,6 +775,8 @@ const make = Effect.gen(function* () {
             gate.withPermit,
             Effect.catch(() => setState(thread.id, "unavailable")),
           );
+          // Let a queued handoff or detach acquire the released permit before the next child.
+          yield* Effect.yieldNow;
         }
       }).pipe(Effect.catch(() => setState(thread.id, "unavailable")));
     }
