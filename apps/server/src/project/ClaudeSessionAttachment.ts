@@ -65,6 +65,7 @@ export class ClaudeSessionAttachmentError extends Schema.TaggedError<ClaudeSessi
   override get message() {
     if (isSourceError(this.cause)) return this.cause.message;
     if (this.reason === "handoff-blocked" && typeof this.cause === "string") return this.cause;
+    if (this.reason === "handoff-blocked" && this.cause instanceof Error) return this.cause.message;
     if (this.reason === "unsupported-provider")
       return "Live attachment is not implemented for this provider. The existing session was not changed.";
     if (this.reason === "unavailable-instance")
@@ -140,17 +141,45 @@ const make = Effect.gen(function* () {
         },
         attachments: [],
         modelSelection: thread.modelSelection,
-        dispatchMode: { type: "start_immediately" },
+        dispatchMode: { type: "queue_after_active" },
         createdBy: "agent",
         creationSource: "server",
       })
       .pipe(
+        Effect.catchTags({
+          OrchestratorCommandPreviouslyRejectedError: Effect.fn(
+            "ClaudeSessionAttachment.retryRejected",
+          )(function* (error) {
+            // A rejected receipt cannot be retried with its old command ID. Rotate
+            // only after a definite rejection; ambiguous failures retain deduplication.
+            const current = yield* projections.getThread(thread.id);
+            if (current.handoffContinuationId === continuationId) {
+              const now = yield* DateTime.now;
+              const retryId = yield* crypto.randomUUIDv4().pipe(Effect.orDie);
+              yield* sink.write({
+                expectedThread: current,
+                events: [
+                  attachmentEvent(
+                    current.id,
+                    "thread.metadata-updated",
+                    { ...current, handoffContinuationId: retryId, updatedAt: now },
+                    now,
+                    `handoff-retry:${retryId}`,
+                  ),
+                ],
+              });
+            }
+            return yield* error;
+          }),
+        }),
         Effect.mapError(
-          () =>
+          (cause) =>
             new ClaudeSessionAttachmentError({
               reason: "handoff-blocked",
-              cause:
+              cause: new Error(
                 "The conversation transferred, but T3 could not resume work yet. T3 will retry automatically; check the thread's provider configuration.",
+                { cause },
+              ),
             }),
         ),
       );

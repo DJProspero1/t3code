@@ -1,5 +1,6 @@
 import * as Crypto from "effect/Crypto";
 import * as ThreadManagement from "../orchestration-v2/ThreadManagementService.ts";
+import { OrchestratorCommandPreviouslyRejectedError } from "../orchestration-v2/Orchestrator.ts";
 import { expect, it } from "@effect/vitest";
 import {
   DEFAULT_SERVER_SETTINGS,
@@ -22,12 +23,15 @@ import * as Attachment from "./ClaudeSessionAttachment.ts";
 import * as Project from "./ProjectService.ts";
 import { attachmentThreadId } from "./claudeAttachmentProjection.ts";
 
-it.effect.each(["wait", "interrupt", "retry"] as const)(
+it.effect.each(["wait", "interrupt", "retry", "rejected"] as const)(
   "preserves history and resumes only an interrupted handoff (interrupt: %s)",
   (mode) =>
     Effect.gen(function* () {
       const interrupt = mode !== "wait";
       let continuationUnavailable = mode === "retry";
+      let rejectContinuation = mode === "rejected";
+      const rejectedCommands = new Set<string>();
+      let randomByte = 0;
       let alive = true;
       let interruptions = 0;
       const dispatched: Array<string> = [];
@@ -104,25 +108,44 @@ it.effect.each(["wait", "interrupt", "retry"] as const)(
         Layer.succeed(
           Crypto.Crypto,
           Crypto.make({
-            randomBytes: (size) => new Uint8Array(size),
+            randomBytes: (size) => new Uint8Array(size).fill(randomByte++),
             digest: (_algorithm, data) => Effect.succeed(data),
           }),
         ),
         Layer.mock(ThreadManagement.ThreadManagementService)({
           dispatch: (command) =>
-            Effect.suspend(() => {
-              if (continuationUnavailable) {
-                continuationUnavailable = false;
-                return Effect.fail(
-                  new ThreadManagement.ThreadManagementProviderInstanceDisabledError({
-                    projectId,
-                    instanceId: ProviderInstanceId.make("claudeAgent"),
-                  }),
-                );
-              }
-              dispatched.push(command.commandId);
-              return Effect.succeed({ sequence: 1, storedEvents: [] });
-            }),
+            Effect.suspend(
+              (): ReturnType<ThreadManagement.ThreadManagementService["Service"]["dispatch"]> => {
+                expect(command.type).toBe("message.dispatch");
+                if (command.type === "message.dispatch") {
+                  expect(command.dispatchMode).toEqual({ type: "queue_after_active" });
+                  expect(command.createdBy).toBe("agent");
+                  expect(command.creationSource).toBe("server");
+                }
+                if (rejectContinuation || rejectedCommands.has(command.commandId)) {
+                  rejectContinuation = false;
+                  rejectedCommands.add(command.commandId);
+                  return Effect.fail(
+                    new OrchestratorCommandPreviouslyRejectedError({
+                      commandId: command.commandId,
+                      commandType: command.type,
+                      detail: "Previously rejected notification",
+                    }),
+                  );
+                }
+                if (continuationUnavailable) {
+                  continuationUnavailable = false;
+                  return Effect.fail(
+                    new ThreadManagement.ThreadManagementProviderInstanceDisabledError({
+                      projectId,
+                      instanceId: ProviderInstanceId.make("claudeAgent"),
+                    }),
+                  );
+                }
+                dispatched.push(command.commandId);
+                return Effect.succeed({ sequence: 1, storedEvents: [] });
+              },
+            ),
         }),
         stores,
         EventSink.layer.pipe(Layer.provide(stores)),
@@ -193,7 +216,7 @@ it.effect.each(["wait", "interrupt", "retry"] as const)(
         restartDuringImport = false;
         alive = interrupt;
         files.delete(child);
-        if (mode === "retry") {
+        if (mode === "retry" || mode === "rejected") {
           yield* service
             .change({ action: "handoff", threadId: attached.threadId, interrupt })
             .pipe(Effect.flip);
