@@ -457,6 +457,7 @@ export const OrchestrationV2AppThread = Schema.Struct({
   branchPullRequest: Schema.optional(Schema.NullOr(ThreadLinkedPullRequest)),
   activeProviderThreadId: Schema.NullOr(ProviderThreadId),
   historyOrigin: Schema.optional(OrchestrationV2ThreadHistoryOrigin),
+  handoffContinuationId: Schema.optional(Schema.String),
   externalSession: Schema.optional(
     Schema.Struct({
       provider: Schema.Literal("claude"),
@@ -464,6 +465,7 @@ export const OrchestrationV2AppThread = Schema.Struct({
       configDirectory: Schema.String,
       transcriptPath: Schema.String,
       attached: Schema.Boolean,
+      handoffContinuationId: Schema.optional(Schema.String),
       projectionVersion: Schema.optional(Schema.Number),
       cursor: Schema.optional(
         Schema.Struct({ offset: Schema.Number, identity: Schema.optional(Schema.String) }),

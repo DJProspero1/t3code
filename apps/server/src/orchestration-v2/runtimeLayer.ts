@@ -396,6 +396,7 @@ export const layerProduction = Layer.mergeAll(
   ClaudeAttachment.layer.pipe(
     Layer.provide(
       Layer.mergeAll(
+        layerThreadManagementProvided,
         ClaudeAttachmentSource.layer,
         layerEventStoreProvided,
         layerProjectService,

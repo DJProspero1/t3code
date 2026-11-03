@@ -2,6 +2,10 @@
 import * as NodeFSP from "node:fs/promises";
 // @effect-diagnostics-next-line nodeBuiltinImport:off - native paths are used inside the filesystem adapter.
 import * as NodePath from "node:path";
+import {
+  makePosixProcessTreeController,
+  terminatePosixOwnedProcessTree,
+} from "@t3tools/provider-acp/server/AcpSessionRuntime";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
@@ -39,15 +43,24 @@ export class ClaudeAttachmentSourceError extends Schema.TaggedError<ClaudeAttach
   "ClaudeAttachmentSourceError",
   {
     operation: Schema.Literals(["discover", "read", "subagents", "handoff"]),
+    reason: Schema.optional(
+      Schema.Literals(["running", "unsupported-interruption", "interruption-failed"]),
+    ),
     cause: Schema.Defect(),
   },
 ) {
   override get message() {
+    if (this.reason === "unsupported-interruption")
+      return "Automatic interruption requires Linux process identity verification. Exit the source CLI and its agents, then use --wait.";
+    if (this.reason === "interruption-failed")
+      return "Could not stop the verified source process tree. The conversation has not transferred. Check the source CLI before retrying handoff.";
     if (this.operation === "handoff")
       return "Handoff requires the original Claude session to have exited after its agents finish. T3 will not stop a process based on transcript inactivity.";
     return `Could not ${this.operation} the Claude session. Check that it is running locally and its transcript is readable.`;
   }
 }
+
+const isSourceError = Schema.is(ClaudeAttachmentSourceError);
 
 export interface TranscriptCursor {
   offset: number;
@@ -61,6 +74,11 @@ export class ClaudeAttachmentSource extends Context.Service<
       sessionId: string,
       uuids: ReadonlyArray<string>,
     ) => Effect.Effect<ReadonlyArray<typeof LiveAlias.Type>, ClaudeAttachmentSourceError>;
+    readonly interrupt: (
+      home: string,
+      sessionId: string,
+      options?: { readonly verifyOnly: true },
+    ) => Effect.Effect<void, ClaudeAttachmentSourceError>;
     readonly assertStopped: (
       home: string,
       sessionId: string,
@@ -184,6 +202,67 @@ export const layer = Layer.sync(ClaudeAttachmentSource, () => {
         catch: (cause) => new ClaudeAttachmentSourceError({ operation: "read", cause }),
       }),
     ),
+    interrupt: Effect.fn("ClaudeAttachmentSource.interrupt")(function* (home, sessionId, options) {
+      const platform = yield* HostProcess.Platform;
+      if (platform !== "linux")
+        return yield* new ClaudeAttachmentSourceError({
+          operation: "handoff",
+          reason: "unsupported-interruption",
+          cause: "Unsupported process identity verification",
+        });
+      const owners = yield* Effect.tryPromise({
+        try: async () => {
+          const controller = makePosixProcessTreeController(platform);
+          const owners = [];
+          for (const name of await NodeFSP.readdir(NodePath.join(home, "sessions"))) {
+            if (!/^\d+\.json$/.test(name)) continue;
+            const session = decodeSession(
+              await NodeFSP.readFile(NodePath.join(home, "sessions", name), "utf8"),
+            );
+            if (session.sessionId !== sessionId) continue;
+            if (!session.procStart || session.pid <= 1 || session.pid === process.pid)
+              throw new Error("Cannot verify source process identity");
+            const identity = controller.identity(session.pid);
+            if (!identity || identity.startTime !== session.procStart) continue;
+            const parent = controller.identity(identity.ppid);
+            if (!parent) throw new Error("Cannot verify source parent identity");
+            owners.push({
+              controller,
+              rootPid: session.pid,
+              root: {
+                value: {
+                  ...identity,
+                  parentStartTime: parent.startTime,
+                  parentExecutable: parent.executable,
+                },
+              },
+            });
+          }
+          return owners;
+        },
+        catch: (cause) =>
+          new ClaudeAttachmentSourceError({
+            operation: "handoff",
+            reason: "interruption-failed",
+            cause,
+          }),
+      });
+      if (options?.verifyOnly) return;
+      for (const owner of owners) {
+        const identity = owner.root.value;
+        const ledger = new Map([[`${identity.pid}:${identity.startTime}`, identity]]);
+        yield* terminatePosixOwnedProcessTree({ ...owner, ledger, grace: "5 seconds" }).pipe(
+          Effect.mapError(
+            (cause) =>
+              new ClaudeAttachmentSourceError({
+                operation: "handoff",
+                reason: "interruption-failed",
+                cause,
+              }),
+          ),
+        );
+      }
+    }),
     assertStopped: Effect.fn("ClaudeAttachmentSource.assertStopped")(function* (home, sessionId) {
       const platform = yield* HostProcess.Platform;
       return yield* Effect.tryPromise({
@@ -211,17 +290,25 @@ export const layer = Layer.sync(ClaudeAttachmentSource, () => {
             if (platform === "linux" && session.procStart) {
               try {
                 const stat = await NodeFSP.readFile(`/proc/${session.pid}/stat`, "utf8");
-                if (stat.slice(stat.lastIndexOf(")") + 2).split(" ")[19] !== session.procStart)
-                  continue;
+                const fields = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
+                if (fields[0] === "Z") continue;
+                if (fields[19] !== session.procStart) continue;
               } catch (cause) {
                 if ((cause as NodeJS.ErrnoException).code === "ENOENT") continue;
                 throw cause;
               }
             }
-            throw new Error("The original session still has a live owner");
+            throw new ClaudeAttachmentSourceError({
+              operation: "handoff",
+              reason: "running",
+              cause: "The original session still has a live owner",
+            });
           }
         },
-        catch: (cause) => new ClaudeAttachmentSourceError({ operation: "handoff", cause }),
+        catch: (cause) =>
+          isSourceError(cause)
+            ? cause
+            : new ClaudeAttachmentSourceError({ operation: "handoff", cause }),
       });
     }),
     tail: Effect.fn("ClaudeAttachmentSource.tail")((home, path) =>

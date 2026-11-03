@@ -1,3 +1,5 @@
+import * as Crypto from "effect/Crypto";
+import * as ThreadManagement from "../orchestration-v2/ThreadManagementService.ts";
 import { expect, it } from "@effect/vitest";
 import {
   DEFAULT_SERVER_SETTINGS,
@@ -99,6 +101,14 @@ it.effect(
       const count = () =>
         sql<{ count: number }>`SELECT count(*) AS count FROM orchestration_v2_projection_messages`;
       const deps = Layer.mergeAll(
+        Layer.succeed(
+          Crypto.Crypto,
+          Crypto.make({
+            randomBytes: (size) => new Uint8Array(size),
+            digest: (_algorithm, data) => Effect.succeed(data),
+          }),
+        ),
+        Layer.mock(ThreadManagement.ThreadManagementService)({}),
         source,
         Layer.mock(ServerSettings.ServerSettingsService)({
           getSettings: Effect.succeed({

@@ -1,3 +1,5 @@
+// @effect-diagnostics-next-line nodeBuiltinImport:off - this isolated fixture owns the processes it starts.
+import * as NodeChildProcess from "node:child_process";
 // @effect-diagnostics-next-line nodeBuiltinImport:off - fixtures exercise the native filesystem adapter.
 import * as NodeFSP from "node:fs/promises";
 import * as NodeOS from "node:os";
@@ -5,6 +7,7 @@ import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
 import { it, expect } from "@effect/vitest";
 import * as Effect from "effect/Effect";
+import * as HostProcess from "@t3tools/shared/HostProcess";
 import * as Source from "./ClaudeAttachmentSource.ts";
 
 const fixture = Effect.acquireRelease(
@@ -155,4 +158,76 @@ it.effect(
         (yield* source.aliases(f.home, f.sessionId, ["escape"]).pipe(Effect.flip)).operation,
       ).toBe("read");
     }).pipe(Effect.provide(Source.layer)),
+);
+
+it.live("interrupts only the verified source owner and its descendants", () =>
+  Effect.gen(function* () {
+    const f = yield* fixture;
+    const source = yield* Source.ClaudeAttachmentSource;
+    // An unverified registry entry must never authorize a signal, on any platform.
+    yield* source.interrupt(f.home, f.sessionId).pipe(Effect.flip);
+    if ((yield* HostProcess.Platform) !== "linux") return;
+    yield* Effect.promise(() =>
+      NodeFSP.unlink(NodePath.join(f.home, "sessions", `${process.pid}.json`)),
+    );
+    const owner = yield* Effect.acquireRelease(
+      Effect.sync(() =>
+        NodeChildProcess.spawn(
+          process.execPath,
+          [
+            "-e",
+            `
+        const { spawn } = require('node:child_process');
+        const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' });
+        process.stdout.write(String(child.pid));
+        setInterval(() => {}, 1000);
+      `,
+          ],
+          { detached: true, stdio: ["ignore", "pipe", "ignore"] },
+        ),
+      ),
+      (child) =>
+        Effect.sync(() => {
+          if (child.pid && child.exitCode === null && child.signalCode === null) {
+            try {
+              process.kill(-child.pid, "SIGKILL");
+            } catch {
+              /* Already exited. */
+            }
+          }
+        }),
+    );
+    const childPid = yield* Effect.promise(
+      () =>
+        new Promise<number>((resolve, reject) => {
+          owner.once("error", reject);
+          owner.stdout!.once("data", (chunk) => resolve(Number(chunk.toString())));
+        }),
+    );
+    const stat = yield* Effect.promise(() => NodeFSP.readFile(`/proc/${owner.pid}/stat`, "utf8"));
+    const start = stat.slice(stat.lastIndexOf(")") + 2).split(" ")[19]!;
+    const registry = NodePath.join(f.home, "sessions", `${owner.pid}.json`);
+    const writeOwner = (procStart: string) =>
+      Effect.promise(() =>
+        NodeFSP.writeFile(
+          registry,
+          JSON.stringify({ pid: owner.pid, procStart, sessionId: f.sessionId, cwd: f.home }),
+        ),
+      );
+    yield* writeOwner("wrong-start-identity");
+    yield* source.interrupt(f.home, f.sessionId);
+    expect(owner.signalCode).toBeNull();
+    yield* writeOwner(start);
+    yield* source.interrupt(f.home, f.sessionId);
+    yield* source.assertStopped(f.home, f.sessionId);
+    const child = yield* Effect.promise(() =>
+      NodeFSP.readFile(`/proc/${childPid}/stat`, "utf8").catch((error) => {
+        if (error.code === "ENOENT") return undefined;
+        throw error;
+      }),
+    );
+    expect(
+      child === undefined || child.slice(child.lastIndexOf(")") + 2).split(" ")[0] === "Z",
+    ).toBe(true);
+  }).pipe(Effect.scoped, Effect.provide(Source.layer)),
 );

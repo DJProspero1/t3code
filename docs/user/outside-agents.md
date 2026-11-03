@@ -120,66 +120,53 @@ Approved agents appear under **Settings → Sharing & access** like other client
 Revoke one there to cut off its access immediately. A sign-in lasts 30 days;
 after that the agent asks you to approve it again.
 
-## Follow a running Claude session
+## Bring a Claude CLI conversation into T3
 
-To view a local Claude Code session and its subagents as a T3 thread while they
-keep running, use its exact live name or session ID:
+Run this on the machine hosting Claude and T3, using the session's exact live name
+or ID and a project already registered with T3:
 
 ```sh
 t3 thread attach repair-session --project /path/to/project
 ```
 
-Run this on the machine hosting both Claude and T3. The project must already be
-registered with T3. Discovery uses Claude's session registry, so the original
-working directory can be missing. The command prints the thread link. History
-loads in the background; newly created subagents are discovered automatically.
-Closing a T3 client does not stop syncing. The server resumes syncing after a restart.
+The command imports the conversation and moves it into T3's normal Claude controls.
+If the source CLI is running, it asks whether to wait for the CLI and its agents
+to exit or interrupt them. Waiting is the default. An idle CLI still owns its
+conversation, so it must exit before transfer. Ctrl+C cancels the wait without
+stopping the source.
 
-On Linux, send text prompts from the attached root thread to the existing Claude
-session. Claude reads them through its local inbox between tool calls. T3 does not
-start another Claude process. Files, slash commands, permissions, model changes,
-and direct subagent controls still require Claude Code; the inbox does not expose
-those operations. A failed or uncertain send is not retried automatically.
-
-Your messages retain their original wording. Claude task notifications, peer messages,
-and context summaries are classified as system activity, not as messages you sent.
-Older imports are repaired in the background after an upgrade.
-
-Recent messages and current activity are read before historical backfill, for both
-the root and its subagents. New messages do not wait for a child’s history-import
-batch. This follows complete transcript records through polling, not token-level
-streaming. Completed subagents are shown as
-completed even while their older messages are still importing. A child with no
-recent activity and no recorded final outcome is shown as idle, not assumed to be
-running. Tool calls and their results appear in the timeline. Pending permission
-dialogs still require Claude Code.
-
-To stop syncing while keeping the imported history:
+For scripts, choose a policy explicitly:
 
 ```sh
-t3 thread detach THREAD_ID
+t3 thread attach repair-session --project /path/to/project --wait
+t3 thread attach repair-session --project /path/to/project --interrupt
 ```
 
-Claude and its agents keep running. Repeat `attach` to reconnect the same T3 thread.
+Interruption on Linux verifies the source process identity, stops its process tree,
+and imports the final complete history. T3 then sends its normal interrupted-turn
+continuation message: resume work, checking whether previous actions completed or
+are still running before repeating them. This continuation survives a T3 restart
+and is not sent twice on a retry. Automatic interruption requires Linux; on other
+platforms, exit the source CLI and use `--wait`.
 
-To continue the conversation through T3's normal Claude controls, first let its work
-finish and exit the original Claude session, then run:
+The same T3 thread and native Claude conversation are retained. Once handoff
+completes, messages, streaming, approvals and controls use T3's normal integration.
+Previous subagents remain as history; their processes are not restored. The resumed
+agent must inspect and restart unfinished work, and newly spawned agents use T3's
+normal integration. If the source exited normally, your next message resumes it.
+
+To finish a transfer for a thread already attached to T3:
 
 ```sh
 t3 thread handoff THREAD_ID
 ```
 
-Handoff imports the remaining history and keeps the same T3 thread and native
-Claude conversation. Your next message starts Claude through T3, with its normal
-streaming, approval and interruption controls. Previous subagents remain as
-history; their processes are not restored. Newly spawned agents use the normal
-T3 integration. The command refuses a running source process, even when it looks
-idle. It does not terminate Claude or detect that all of its work is finished.
+This command offers the same choice and accepts `--wait` or `--interrupt`.
+While waiting, imported history follows the source's complete transcript records.
+Cancelling a wait leaves that history available. To stop following without stopping
+Claude, use `t3 thread detach THREAD_ID`.
 
-This handoff currently supports attached Claude sessions only.
-Use `--provider INSTANCE_ID` to select another configured Claude account. Attachment
-uses that instance's home folder and environment settings. A disabled or different
-provider is rejected before any thread is created. The default instance is `claudeAgent`.
-
-Sending requires full-access permission because T3 cannot reduce the permissions
-of an externally owned process. T3's managed permission ceiling still applies.
+Handoff currently supports attached Claude sessions. Use `--provider INSTANCE_ID`
+on `attach` to select another configured Claude account; the default is `claudeAgent`.
+The original provider account must still be enabled when transferring. T3's managed
+permission ceiling applies after handoff.

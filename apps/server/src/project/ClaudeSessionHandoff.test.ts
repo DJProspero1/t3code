@@ -1,5 +1,12 @@
+import * as Crypto from "effect/Crypto";
+import * as ThreadManagement from "../orchestration-v2/ThreadManagementService.ts";
 import { expect, it } from "@effect/vitest";
-import { DEFAULT_SERVER_SETTINGS, ProjectId, ProviderDriverKind } from "@t3tools/contracts";
+import {
+  DEFAULT_SERVER_SETTINGS,
+  ProjectId,
+  ProviderInstanceId,
+  ProviderDriverKind,
+} from "@t3tools/contracts";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
@@ -15,11 +22,15 @@ import * as Attachment from "./ClaudeSessionAttachment.ts";
 import * as Project from "./ProjectService.ts";
 import { attachmentThreadId } from "./claudeAttachmentProjection.ts";
 
-it.effect(
-  "keeps a live source untouched, then drains history and preserves the native conversation on handoff",
-  () =>
+it.effect.each(["wait", "interrupt", "retry"] as const)(
+  "preserves history and resumes only an interrupted handoff (interrupt: %s)",
+  (mode) =>
     Effect.gen(function* () {
+      const interrupt = mode !== "wait";
+      let continuationUnavailable = mode === "retry";
       let alive = true;
+      let interruptions = 0;
+      const dispatched: Array<string> = [];
       let restartDuringImport = false;
       let incomplete = false;
       let accountHome = "/claude";
@@ -41,12 +52,22 @@ it.effect(
       ]);
       const source = Layer.mock(Source.ClaudeAttachmentSource)({
         aliases: () => Effect.succeed([]),
+        interrupt: (_home, _sessionId, options) =>
+          Effect.sync(() => {
+            if (options?.verifyOnly) return;
+            interruptions++;
+            alive = false;
+          }),
         discover: () =>
           Effect.succeed({ sessionId: "session", title: "Session", transcriptPath: root }),
         assertStopped: () =>
           alive
             ? Effect.fail(
-                new Source.ClaudeAttachmentSourceError({ operation: "handoff", cause: "alive" }),
+                new Source.ClaudeAttachmentSourceError({
+                  operation: "handoff",
+                  reason: "running",
+                  cause: "alive",
+                }),
               )
             : Effect.void,
         children: () =>
@@ -80,6 +101,29 @@ it.effect(
         Layer.provideMerge(Sqlite.layerMemory),
       );
       const deps = Layer.mergeAll(
+        Layer.succeed(
+          Crypto.Crypto,
+          Crypto.make({
+            randomBytes: (size) => new Uint8Array(size),
+            digest: (_algorithm, data) => Effect.succeed(data),
+          }),
+        ),
+        Layer.mock(ThreadManagement.ThreadManagementService)({
+          dispatch: (command) =>
+            Effect.suspend(() => {
+              if (continuationUnavailable) {
+                continuationUnavailable = false;
+                return Effect.fail(
+                  new ThreadManagement.ThreadManagementProviderInstanceDisabledError({
+                    projectId,
+                    instanceId: ProviderInstanceId.make("claudeAgent"),
+                  }),
+                );
+              }
+              dispatched.push(command.commandId);
+              return Effect.succeed({ sequence: 1, storedEvents: [] });
+            }),
+        }),
         stores,
         EventSink.layer.pipe(Layer.provide(stores)),
         source,
@@ -132,7 +176,9 @@ it.effect(
             .pipe(Effect.flip)).reason,
         ).toBe("unavailable-instance");
         accountEnabled = true;
-        yield* service.change({ action: "handoff", threadId: attached.threadId }).pipe(Effect.flip);
+        expect(
+          (yield* service.change({ action: "handoff", threadId: attached.threadId })).blocked,
+        ).toBe(true);
         expect(yield* projections.getThread(attached.threadId)).toEqual(before);
         alive = false;
         incomplete = true;
@@ -145,14 +191,28 @@ it.effect(
         yield* service.change({ action: "handoff", threadId: attached.threadId }).pipe(Effect.flip);
         expect((yield* projections.getThread(attached.threadId)).externalSession).toBeDefined();
         restartDuringImport = false;
-        alive = false;
+        alive = interrupt;
         files.delete(child);
-        expect(yield* service.change({ action: "handoff", threadId: attached.threadId })).toEqual({
+        if (mode === "retry") {
+          yield* service
+            .change({ action: "handoff", threadId: attached.threadId, interrupt })
+            .pipe(Effect.flip);
+          const pending = yield* projections.getThread(attached.threadId);
+          expect(pending.externalSession).toBeUndefined();
+          expect(pending.handoffContinuationId).toBeDefined();
+          expect(interruptions).toBe(1);
+        }
+        expect(
+          yield* service.change({ action: "handoff", threadId: attached.threadId, interrupt }),
+        ).toEqual({
           threadId: attached.threadId,
           attached: false,
           readOnly: false,
         });
+        expect(interruptions).toBe(interrupt ? 1 : 0);
+        expect(dispatched.length).toBe(interrupt ? 1 : 0);
         const after = yield* projections.getThread(attached.threadId);
+        expect(after.handoffContinuationId).toBeUndefined();
         expect(after.externalSession).toBeUndefined();
         expect(after.worktreePath).toBe("/work/original");
         expect(after.modelSelection.model).toBe("claude-sonnet-4-6");
@@ -176,6 +236,7 @@ it.effect(
           readOnly: false,
         });
         expect(yield* projections.getThread(attached.threadId)).toEqual(after);
+        expect(dispatched.length).toBe(interrupt ? 1 : 0);
       }).pipe(Effect.provide(Attachment.layer.pipe(Layer.provideMerge(deps))));
     }),
 );

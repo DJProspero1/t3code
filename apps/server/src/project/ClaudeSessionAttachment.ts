@@ -1,5 +1,6 @@
 import {
   ClaudeSettings,
+  CommandId,
   resolveProviderInstanceEnabled,
   DEFAULT_MODEL_BY_PROVIDER,
   DEFAULT_MODEL,
@@ -18,6 +19,7 @@ import {
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
+import * as Crypto from "effect/Crypto";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
@@ -43,6 +45,9 @@ import {
   attachmentThreadId,
   projectAttachmentLine,
 } from "./claudeAttachmentProjection.ts";
+
+import * as ThreadManagement from "../orchestration-v2/ThreadManagementService.ts";
+import { CONTINUE_PROMPT } from "../orchestration-v2/RestartContinuation.ts";
 
 const PROJECTION_VERSION = 5;
 
@@ -75,6 +80,7 @@ export class ClaudeSessionAttachment extends Context.Service<
         threadId: ThreadId;
         attached: boolean;
         readOnly: boolean;
+        blocked?: boolean;
       },
       ClaudeSessionAttachmentError
     >;
@@ -88,6 +94,9 @@ const decodeClaudeSettings = Schema.decodeUnknownEffect(ClaudeSettings);
 
 const make = Effect.gen(function* () {
   const source = yield* Source.ClaudeAttachmentSource;
+  const threads = yield* ThreadManagement.ThreadManagementService;
+  const crypto = yield* Crypto.Crypto;
+  const pendingContinuations = new Set<ThreadId>();
   const sink = yield* EventSink.EventSinkV2;
   const eventStore = yield* EventStore.EventStoreV2;
   const projections = yield* ProjectionStore.ProjectionStoreV2;
@@ -101,6 +110,66 @@ const make = Effect.gen(function* () {
   const gate = yield* Semaphore.make(1);
   const handoffGate = yield* Semaphore.make(1);
   const syncedFiles = new Map<string, string>();
+
+  const resumeHandoff = Effect.fn("ClaudeSessionAttachment.resumeHandoff")(function* (
+    thread: OrchestrationV2AppThread,
+  ) {
+    const continuationId = thread.handoffContinuationId;
+    if (
+      !continuationId ||
+      thread.externalSession ||
+      thread.deletedAt !== null ||
+      thread.archivedAt !== null
+    ) {
+      pendingContinuations.delete(thread.id);
+      return;
+    }
+    pendingContinuations.add(thread.id);
+    yield* threads
+      .dispatch({
+        type: "message.dispatch",
+        commandId: CommandId.make(`command:handoff-continuation:${thread.id}:${continuationId}`),
+        messageId: MessageId.make(`message:handoff-continuation:${thread.id}:${continuationId}`),
+        threadId: thread.id,
+        text: CONTINUE_PROMPT,
+        notification: {
+          source: { kind: "system" },
+          outcome: "updated",
+          summary: "T3 Code resumed work after session handoff",
+          detail: CONTINUE_PROMPT,
+        },
+        attachments: [],
+        modelSelection: thread.modelSelection,
+        dispatchMode: { type: "start_immediately" },
+        createdBy: "agent",
+        creationSource: "server",
+      })
+      .pipe(
+        Effect.mapError(
+          () =>
+            new ClaudeSessionAttachmentError({
+              reason: "handoff-blocked",
+              cause:
+                "The conversation transferred, but T3 could not resume work yet. T3 will retry automatically; check the thread's provider configuration.",
+            }),
+        ),
+      );
+    const current = yield* projections.getThread(thread.id);
+    const now = yield* DateTime.now;
+    const cleared = yield* sink.write({
+      expectedThread: current,
+      events: [
+        attachmentEvent(
+          current.id,
+          "thread.metadata-updated",
+          { ...current, handoffContinuationId: undefined, updatedAt: now },
+          now,
+          `handoff-resumed:${continuationId}`,
+        ),
+      ],
+    });
+    if (cleared.length) pendingContinuations.delete(thread.id);
+  });
 
   const resolveConfigDirectory = Effect.fn("ClaudeSessionAttachment.resolveConfigDirectory")(
     function* (providerInstanceId: ProviderInstanceId) {
@@ -721,8 +790,10 @@ const make = Effect.gen(function* () {
       if (input.action === "handoff") {
         const initial = yield* projections.getThread(input.threadId);
         const external = initial.externalSession;
-        if (!external && initial.lineage.parentThreadId === null && initial.deletedAt === null)
+        if (!external && initial.lineage.parentThreadId === null && initial.deletedAt === null) {
+          yield* resumeHandoff(initial);
           return { threadId: initial.id, attached: false, readOnly: false };
+        }
         if (!external || initial.lineage.parentThreadId !== null || initial.deletedAt !== null)
           return yield* new ClaudeSessionAttachmentError({
             reason: "handoff-blocked",
@@ -735,7 +806,26 @@ const make = Effect.gen(function* () {
             cause:
               "The provider account changed since attachment. Restore its original configuration before handoff.",
           });
-        yield* source.assertStopped(external.configDirectory, external.sessionId);
+        const running = yield* source
+          .assertStopped(external.configDirectory, external.sessionId)
+          .pipe(
+            Effect.as(false),
+            Effect.catchIf(
+              (error) => error.reason === "running",
+              () => Effect.succeed(true),
+            ),
+          );
+        if (running && !input.interrupt)
+          return {
+            threadId: initial.id,
+            attached: external.attached,
+            readOnly: false,
+            blocked: true,
+          };
+        if (running && input.interrupt)
+          yield* source.interrupt(external.configDirectory, external.sessionId, {
+            verifyOnly: true,
+          });
         // Block new inbox sends before draining history; failed handoffs remain detached for retry.
         yield* setState(initial.id, "detached").pipe(gate.withPermit);
         const pending = yield* sql<{ effect_id: string }>`
@@ -748,6 +838,39 @@ const make = Effect.gen(function* () {
             reason: "handoff-blocked",
             cause: "Wait for pending inbox deliveries to settle before retrying handoff",
           });
+        if (running && input.interrupt) {
+          const currentSource = yield* projections.getThread(initial.id);
+          const now = yield* DateTime.now;
+          const continuationId =
+            currentSource.externalSession?.handoffContinuationId ??
+            (yield* crypto.randomUUIDv4().pipe(Effect.orDie));
+          const written = yield* sink.write({
+            expectedThread: currentSource,
+            events: [
+              attachmentEvent(
+                initial.id,
+                "thread.metadata-updated",
+                {
+                  ...currentSource,
+                  externalSession: {
+                    ...currentSource.externalSession!,
+                    handoffContinuationId: continuationId,
+                  },
+                  updatedAt: now,
+                },
+                now,
+                `handoff-interrupt:${DateTime.toEpochMillis(now)}`,
+              ),
+            ],
+          });
+          if (!written.length)
+            return yield* new ClaudeSessionAttachmentError({
+              reason: "handoff-blocked",
+              cause: "Thread changed before interruption",
+            });
+          yield* source.interrupt(external.configDirectory, external.sessionId);
+          yield* source.assertStopped(external.configDirectory, external.sessionId);
+        }
         let cwd: string | undefined;
         const firstRecords = yield* source.read(external.configDirectory, external.transcriptPath, {
           offset: 0,
@@ -871,7 +994,13 @@ const make = Effect.gen(function* () {
             attachmentEvent(
               current.id,
               "thread.metadata-updated",
-              { ...current, externalSession: undefined, worktreePath: cwd, updatedAt: now },
+              {
+                ...current,
+                externalSession: undefined,
+                handoffContinuationId: current.externalSession?.handoffContinuationId,
+                worktreePath: cwd,
+                updatedAt: now,
+              },
               now,
               `handoff:${DateTime.toEpochMillis(now)}`,
             ),
@@ -882,6 +1011,7 @@ const make = Effect.gen(function* () {
             reason: "handoff-blocked",
             cause: "Thread changed during handoff",
           });
+        yield* resumeHandoff(yield* projections.getThread(current.id));
         return { threadId: current.id, attached: false, readOnly: false };
       }
       if (input.action === "detach") {
@@ -923,9 +1053,19 @@ const make = Effect.gen(function* () {
     ),
   );
   yield* Effect.gen(function* () {
-    yield* sync.pipe(Effect.ignore());
-    yield* Effect.sleep(backfillPending ? "10 millis" : "2 seconds");
-  }).pipe(Effect.forever, forkParked);
+    const pending = yield* sql<{
+      thread_id: string;
+    }>`SELECT thread_id FROM orchestration_v2_projection_threads WHERE json_extract(payload_json, '$.handoffContinuationId') IS NOT NULL`;
+    for (const row of pending) pendingContinuations.add(ThreadId.make(row.thread_id));
+    return yield* Effect.gen(function* () {
+      yield* sync.pipe(Effect.ignore());
+      for (const threadId of pendingContinuations)
+        yield* resumeHandoff(yield* projections.getThread(threadId)).pipe(
+          Effect.ignore({ log: true }),
+        );
+      yield* Effect.sleep(backfillPending ? "10 millis" : "2 seconds");
+    }).pipe(Effect.forever);
+  }).pipe(forkParked);
   return ClaudeSessionAttachment.of({ change, sync });
 });
 export const layer = Layer.effect(ClaudeSessionAttachment, make);
