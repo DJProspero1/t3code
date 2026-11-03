@@ -16,6 +16,7 @@ export class TurnItemPositionStoreError extends Schema.TaggedError<TurnItemPosit
 ) {}
 
 const isTurnItemPositionStoreError = Schema.is(TurnItemPositionStoreError);
+export const CHRONOLOGICAL_POSITION_MIN = 100_000_000_000_000;
 
 export interface TurnItemPositionStoreV2Shape {
   readonly allocate: (input: {
@@ -58,7 +59,7 @@ export const layer: Layer.Layer<TurnItemPositionStoreV2, never, SqlClient.SqlCli
           WHERE thread_id = ${threadId} AND turn_item_id = ${turnItemId}
           LIMIT 1
         `;
-          if (sourceTimestamp !== undefined && runId === null) {
+          if (sourceTimestamp !== undefined) {
             // Reserve a millisecond bucket for source-ordered imports. Existing native
             // positions remain stable; legacy arrival-order imports are upgraded once.
             const base = 1_000_000 + DateTime.toEpochMillis(sourceTimestamp) * 1000;
@@ -68,7 +69,7 @@ export const layer: Layer.Layer<TurnItemPositionStoreV2, never, SqlClient.SqlCli
                 turnItemId,
                 cause: "Invalid source timestamp",
               });
-            if (existing[0] !== undefined && existing[0].ordinal >= 1_000_000)
+            if (existing[0] !== undefined && existing[0].ordinal >= CHRONOLOGICAL_POSITION_MIN)
               return existing[0].ordinal;
             const rows = yield* sql<{ ordinal: number }>`
               SELECT COALESCE(MAX(ordinal), ${base - 1}) + 1 AS ordinal

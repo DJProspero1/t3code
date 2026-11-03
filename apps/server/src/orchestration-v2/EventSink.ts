@@ -344,11 +344,7 @@ const layerBase: Layer.Layer<
     ) {
       const candidates = [
         ...new Set(
-          events.flatMap((event) =>
-            event.type === "turn-item.updated" && event.payload.runId === null
-              ? [event.threadId]
-              : [],
-          ),
+          events.flatMap((event) => (event.type === "turn-item.updated" ? [event.threadId] : [])),
         ),
       ];
       const sourceOrdered = new Set(
@@ -357,7 +353,12 @@ const layerBase: Layer.Layer<
           : (yield* sql<{ thread_id: string }>`
         SELECT thread_id FROM orchestration_v2_projection_threads
         WHERE thread_id IN (SELECT value FROM json_each(${encodeEventIds(candidates)}))
-          AND json_extract(payload_json, '$.externalSession') IS NOT NULL
+          AND (json_extract(payload_json, '$.externalSession') IS NOT NULL
+            OR EXISTS (
+              SELECT 1 FROM orchestration_v2_turn_item_positions positions
+              WHERE positions.thread_id = orchestration_v2_projection_threads.thread_id
+                AND positions.ordinal >= ${TurnItemPositionStore.CHRONOLOGICAL_POSITION_MIN}
+            ))
       `).map((row) => row.thread_id),
       );
       const runOrdinals = new Map(

@@ -79,6 +79,26 @@ it.effect("orders external history before live messages and upgrades legacy posi
     });
     assert.isBelow(old, recent);
     assert.isAbove(simultaneous, recent);
+    const managed = {
+      ...input,
+      turnItemId: TurnItemId.make("managed"),
+      runId: RunId.make("managed-run"),
+      runOrdinal: 1,
+    };
+    const beforeRepair = yield* positions.allocate(managed);
+    assert.isBelow(beforeRepair, old);
+    const afterRepair = yield* positions.allocate({
+      ...managed,
+      sourceTimestamp: DateTime.makeUnsafe("2026-11-02T14:00:00Z"),
+    });
+    assert.isAbove(afterRepair, simultaneous);
+    assert.equal(
+      yield* positions.allocate({
+        ...managed,
+        sourceTimestamp: DateTime.makeUnsafe("2026-11-02T15:00:00Z"),
+      }),
+      afterRepair,
+    );
     assert.equal(
       yield* positions.allocate({
         ...input,

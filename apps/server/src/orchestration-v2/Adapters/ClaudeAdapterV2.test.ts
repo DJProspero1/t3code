@@ -2669,7 +2669,12 @@ describe("ClaudeAdapterV2 MCP credential channel", () => {
 });
 
 describe("ClaudeAdapterV2 native session identity", () => {
-  const openTurnWithOrdinal = (providerTurnOrdinal: number, nativeThreadHasTurns?: boolean) =>
+  const openTurnWithOrdinal = (
+    providerTurnOrdinal: number,
+    nativeThreadHasTurns?: boolean,
+    explicitResume = false,
+    resumeTranscriptPath?: string,
+  ) =>
     Effect.scoped(
       Effect.gen(function* () {
         const fileSystem = yield* FileSystem.FileSystem;
@@ -2717,11 +2722,17 @@ describe("ClaudeAdapterV2 native session identity", () => {
           modelSelection: CLAUDE_TEST_MODEL_SELECTION,
           runtimePolicy: CLAUDE_TEST_RUNTIME_POLICY,
         });
-        const providerThread = yield* runtime.ensureThread({
+        let providerThread = yield* runtime.ensureThread({
           threadId,
           modelSelection: CLAUDE_TEST_MODEL_SELECTION,
           runtimePolicy: CLAUDE_TEST_RUNTIME_POLICY,
         });
+        if (resumeTranscriptPath !== undefined)
+          providerThread = {
+            ...providerThread,
+            nativeMetadata: { claudeResumeTranscriptPath: resumeTranscriptPath },
+          };
+        if (explicitResume) yield* runtime.resumeThread({ providerThread });
         const now = yield* DateTime.now;
         yield* runtime.startTurn(
           makeClaudeTestTurnInput({
@@ -2761,6 +2772,25 @@ describe("ClaudeAdapterV2 native session identity", () => {
       assert.equal(openedQueries[0]?.options.sessionId, "native-session-identity");
       assert.equal(openedQueries[0]?.options.resume, undefined);
       assert.equal(openedQueries[0]?.options.title, "Claude attachment test");
+    }),
+  );
+  it.effect("resumes an explicitly adopted conversation before its first T3 turn", () =>
+    Effect.gen(function* () {
+      const openedQueries = yield* openTurnWithOrdinal(1, false, true);
+      assert.equal(openedQueries[0]?.options.resume, "native-session-identity");
+      assert.equal(openedQueries[0]?.options.sessionId, undefined);
+    }),
+  );
+  it.effect("resumes the imported transcript when its checkout moved", () =>
+    Effect.gen(function* () {
+      const opened = yield* openTurnWithOrdinal(
+        1,
+        false,
+        true,
+        "/claude/projects/old/session.jsonl",
+      );
+      assert.equal(opened[0]?.options.resume, "/claude/projects/old/session.jsonl");
+      assert.equal(opened[0]?.options.sessionId, undefined);
     }),
   );
 });

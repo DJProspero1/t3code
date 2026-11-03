@@ -48,6 +48,8 @@ import {
 
 import * as ThreadManagement from "../orchestration-v2/ThreadManagementService.ts";
 import { CONTINUE_PROMPT } from "../orchestration-v2/RestartContinuation.ts";
+import { isActiveRun } from "../orchestration-v2/CommandPolicy.ts";
+import { CHRONOLOGICAL_POSITION_MIN } from "../orchestration-v2/TurnItemPositionStore.ts";
 
 const PROJECTION_VERSION = 5;
 
@@ -230,6 +232,88 @@ const make = Effect.gen(function* () {
       );
     },
   );
+
+  const recoverLegacyHandoff = Effect.fn("ClaudeSessionAttachment.recoverLegacyHandoff")(function* (
+    thread: OrchestrationV2AppThread,
+    resume = false,
+  ) {
+    if (
+      thread.externalSession ||
+      thread.lineage.parentThreadId !== null ||
+      thread.deletedAt !== null ||
+      thread.archivedAt !== null ||
+      !thread.id.startsWith("claude-attached-")
+    )
+      return;
+    const records = yield* projections.getThreadRecords(thread.id, ["providerThreads", "runs"]);
+    const binding = records.providerThreads.find(
+      (item) => item.id === thread.activeProviderThreadId,
+    );
+    if (
+      !binding ||
+      binding.nativeMetadata?.claudeHandoffVersion === 2 ||
+      binding.pendingBackgroundTasks?.length ||
+      records.runs.some(isActiveRun)
+    )
+      return;
+    const original = (yield* eventStore.readByIds([
+      attachmentEvent(thread.id, "thread.created", thread, thread.createdAt, thread.id).id,
+    ])).find((row) => row.event.type === "thread.created")?.event;
+    if (original?.type !== "thread.created" || !original.payload.externalSession) return;
+    const sourceBinding = original.payload.externalSession;
+    if (binding.nativeThreadRef?.nativeId !== sourceBinding.sessionId) return;
+    // Keep the current workspace. Claude can resume the exact transcript even
+    // when its original checkout has been deleted or another copy has the same ID.
+    yield* source.read(sourceBinding.configDirectory, sourceBinding.transcriptPath, { offset: 0 });
+    const oldPositions = yield* sql<{ turn_item_id: string }>`
+      SELECT turn_item_id FROM orchestration_v2_projection_turn_items
+      WHERE thread_id = ${thread.id} AND ordinal < ${CHRONOLOGICAL_POSITION_MIN}
+    `;
+    const items = oldPositions.length
+      ? (yield* projections.getThreadRecords(thread.id, ["turnItems"], {
+          turnItemIds: oldPositions.map((row) => TurnItemId.make(row.turn_item_id)),
+        })).turnItems
+      : [];
+    const now = yield* DateTime.now;
+    const continuationId =
+      thread.handoffContinuationId ??
+      (resume ? yield* crypto.randomUUIDv4().pipe(Effect.orDie) : undefined);
+    const committed = yield* sink.write({
+      expectedThread: thread,
+      events: [
+        ...items.map((item) =>
+          attachmentEvent(thread.id, "turn-item.updated", item, now, `handoff-order-v2:${item.id}`),
+        ),
+        attachmentEvent(
+          thread.id,
+          "provider-thread.updated",
+          {
+            ...binding,
+            nativeMetadata: {
+              ...binding.nativeMetadata,
+              claudeHandoffVersion: 2,
+              claudeResumeTranscriptPath: sourceBinding.transcriptPath,
+            },
+            updatedAt: now,
+          },
+          now,
+          "handoff-binding-recovery-v2",
+        ),
+        attachmentEvent(
+          thread.id,
+          "thread.metadata-updated",
+          {
+            ...thread,
+            handoffContinuationId: continuationId,
+            updatedAt: now,
+          },
+          now,
+          "handoff-recover-v2",
+        ),
+      ],
+    });
+    if (committed.length && continuationId) pendingContinuations.add(thread.id);
+  });
 
   const create = Effect.fn("ClaudeSessionAttachment.create")(function* (
     parent: OrchestrationV2AppThread | null,
@@ -822,7 +906,8 @@ const make = Effect.gen(function* () {
         const initial = yield* projections.getThread(input.threadId);
         const external = initial.externalSession;
         if (!external && initial.lineage.parentThreadId === null && initial.deletedAt === null) {
-          yield* resumeHandoff(initial);
+          yield* recoverLegacyHandoff(initial, true);
+          yield* resumeHandoff(yield* projections.getThread(initial.id));
           return { threadId: initial.id, attached: false, readOnly: false };
         }
         if (!external || initial.lineage.parentThreadId !== null || initial.deletedAt !== null)
@@ -1018,10 +1103,33 @@ const make = Effect.gen(function* () {
             cause: "The original workspace could not be determined from the transcript",
           });
         const current = yield* projections.getThread(initial.id);
+        const binding = (yield* projections.getThreadRecords(initial.id, [
+          "providerThreads",
+        ])).providerThreads.find((item) => item.id === current.activeProviderThreadId);
+        if (!binding || binding.nativeThreadRef?.nativeId !== external.sessionId)
+          return yield* new ClaudeSessionAttachmentError({
+            reason: "handoff-blocked",
+            cause: "The original native conversation binding is missing.",
+          });
         const now = yield* DateTime.now;
         const committed = yield* sink.write({
           expectedThread: current,
           events: [
+            attachmentEvent(
+              current.id,
+              "provider-thread.updated",
+              {
+                ...binding,
+                nativeMetadata: {
+                  ...binding.nativeMetadata,
+                  claudeHandoffVersion: 2,
+                  claudeResumeTranscriptPath: external.transcriptPath,
+                },
+                updatedAt: now,
+              },
+              now,
+              "handoff-binding-v2",
+            ),
             attachmentEvent(
               current.id,
               "thread.metadata-updated",
@@ -1084,6 +1192,17 @@ const make = Effect.gen(function* () {
     ),
   );
   yield* Effect.gen(function* () {
+    const legacy = yield* sql<{ thread_id: string }>`
+      SELECT thread_id FROM orchestration_v2_projection_threads
+      WHERE thread_id LIKE 'claude-attached-%'
+        AND json_extract(payload_json, '$.externalSession') IS NULL
+        AND json_extract(payload_json, '$.lineage.parentThreadId') IS NULL
+    `;
+    for (const row of legacy)
+      yield* Effect.gen(function* () {
+        const thread = yield* projections.getThread(ThreadId.make(row.thread_id));
+        if (thread.handoffContinuationId) yield* recoverLegacyHandoff(thread);
+      }).pipe(Effect.ignore({ log: true }));
     const pending = yield* sql<{
       thread_id: string;
     }>`SELECT thread_id FROM orchestration_v2_projection_threads WHERE json_extract(payload_json, '$.handoffContinuationId') IS NOT NULL`;

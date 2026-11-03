@@ -10,6 +10,7 @@ import {
 } from "@t3tools/contracts";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import * as Effect from "effect/Effect";
+import * as DateTime from "effect/DateTime";
 import * as Layer from "effect/Layer";
 import * as Path from "effect/Path";
 import * as EventSink from "../orchestration-v2/EventSink.ts";
@@ -21,9 +22,9 @@ import * as ServerSettings from "../serverSettings.ts";
 import * as Source from "./ClaudeAttachmentSource.ts";
 import * as Attachment from "./ClaudeSessionAttachment.ts";
 import * as Project from "./ProjectService.ts";
-import { attachmentThreadId } from "./claudeAttachmentProjection.ts";
+import { attachmentEvent, attachmentThreadId } from "./claudeAttachmentProjection.ts";
 
-it.effect.each(["wait", "interrupt", "retry", "rejected"] as const)(
+it.effect.each(["wait", "interrupt", "retry", "rejected", "legacy"] as const)(
   "preserves history and resumes only an interrupted handoff (interrupt: %s)",
   (mode) =>
     Effect.gen(function* () {
@@ -46,7 +47,7 @@ it.effect.each(["wait", "interrupt", "retry", "rejected"] as const)(
           type: "assistant",
           uuid,
           sessionId: "session",
-          cwd: "/work/original",
+          cwd: uuid === "latest" ? "/work/later" : "/work/original",
           timestamp: "2026-01-01T00:00:00Z",
           message: { content: uuid, stop_reason: "end_turn", model: "claude-sonnet-4-6" },
         });
@@ -237,7 +238,7 @@ it.effect.each(["wait", "interrupt", "retry", "rejected"] as const)(
         const after = yield* projections.getThread(attached.threadId);
         expect(after.handoffContinuationId).toBeUndefined();
         expect(after.externalSession).toBeUndefined();
-        expect(after.worktreePath).toBe("/work/original");
+        expect(after.worktreePath).toBe("/work/later");
         expect(after.modelSelection.model).toBe("claude-sonnet-4-6");
         expect(after.activeProviderThreadId).toBe(before.activeProviderThreadId);
         const records = yield* projections.getThreadRecords(attached.threadId, [
@@ -246,6 +247,7 @@ it.effect.each(["wait", "interrupt", "retry", "rejected"] as const)(
         ]);
         expect(records.messages.map((message) => message.text).sort()).toEqual(["first", "latest"]);
         expect(records.providerThreads[0]?.nativeThreadRef?.nativeId).toBe("session");
+        expect(records.providerThreads[0]?.nativeMetadata?.claudeResumeTranscriptPath).toBe(root);
         const childId = attachmentThreadId("/claude", "session", "child");
         expect((yield* projections.getThread(childId)).externalSession?.attached).toBe(false);
         expect((yield* projections.getThreadRecords(childId, ["messages"])).messages[0]?.text).toBe(
@@ -260,6 +262,40 @@ it.effect.each(["wait", "interrupt", "retry", "rejected"] as const)(
         });
         expect(yield* projections.getThread(attached.threadId)).toEqual(after);
         expect(dispatched.length).toBe(interrupt ? 1 : 0);
+        if (mode === "legacy") {
+          const sink = yield* EventSink.EventSinkV2;
+          const now = yield* DateTime.now;
+          const binding = records.providerThreads[0]!;
+          yield* sink.write({
+            events: [
+              attachmentEvent(
+                after.id,
+                "provider-thread.updated",
+                {
+                  ...binding,
+                  nativeMetadata: null,
+                },
+                now,
+                "legacy-binding-fixture",
+              ),
+              attachmentEvent(
+                after.id,
+                "thread.metadata-updated",
+                {
+                  ...after,
+                  worktreePath: "/work/later",
+                },
+                now,
+                "legacy-workspace-fixture",
+              ),
+            ],
+          });
+          yield* service.change({ action: "handoff", threadId: after.id });
+          expect((yield* projections.getThread(after.id)).worktreePath).toBe("/work/later");
+          expect(dispatched.length).toBe(2);
+          yield* service.change({ action: "handoff", threadId: after.id });
+          expect(dispatched.length).toBe(2);
+        }
       }).pipe(Effect.provide(Attachment.layer.pipe(Layer.provideMerge(deps))));
     }),
 );

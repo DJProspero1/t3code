@@ -1471,6 +1471,7 @@ export function makeClaudeQueryOptions(input: {
   readonly title?: string;
   readonly resume: boolean;
   readonly resumeSessionAt?: string;
+  readonly resumeTranscriptPath?: string;
   readonly cwd: string | null;
   readonly attachmentsDir?: string;
   readonly settings?: ClaudeSettings;
@@ -1518,7 +1519,7 @@ export function makeClaudeQueryOptions(input: {
     extraArgs["thinking-display"] = "summarized";
   }
   const threadIdentity: ClaudeAgentSdkThreadIdentity = input.resume
-    ? { resume: input.nativeThreadId }
+    ? { resume: input.resumeTranscriptPath ?? input.nativeThreadId }
     : { sessionId: input.nativeThreadId };
   const selectedTools = input.tools ?? CLAUDE_CODE_PRESET_TOOLS;
   const selectionSettings =
@@ -10354,6 +10355,12 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
             nativeThreadId,
             title: turnInput.appThread.title,
             resume: shouldResume,
+            ...(turnInput.providerThread.nativeMetadata?.claudeResumeTranscriptPath === undefined
+              ? {}
+              : {
+                  resumeTranscriptPath:
+                    turnInput.providerThread.nativeMetadata.claudeResumeTranscriptPath,
+                }),
             ...(resumeSessionAt === undefined ? {} : { resumeSessionAt }),
             cwd: turnInput.runtimePolicy.cwd,
             attachmentsDir,
@@ -11264,6 +11271,11 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
                   driver: CLAUDE_PROVIDER,
                   detail: `Claude session ${nativeThreadId} has no conversation to resume.`,
                 });
+              }
+              if (nativeThreadId !== undefined && nativeThreadId !== null) {
+                yield* Ref.update(openedNativeThreads, (current) =>
+                  new Set(current).add(nativeThreadId),
+                );
               }
               const updatedAt = yield* DateTime.now;
               return {
