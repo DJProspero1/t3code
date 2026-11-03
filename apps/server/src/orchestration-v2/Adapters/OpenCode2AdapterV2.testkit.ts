@@ -285,6 +285,7 @@ export const openCode2ReplayRuntime = (
   entries: ReadonlyArray<ProviderReplayEntry>,
   options?: {
     readonly external?: boolean;
+    readonly nativeThreadId?: string;
     readonly onPrompt?: (input: unknown) => void;
     readonly borrowers?: { current: number };
     readonly replayGate?: ProviderReplayGate;
@@ -305,7 +306,7 @@ export const openCode2ReplayRuntime = (
       },
       options,
     ).pipe(Effect.provideService(FileSystem.FileSystem, fileSystem));
-    return yield* adapter.openSession({
+    const input = {
       threadId: ThreadId.make("thread:opencode2-adapter"),
       providerSessionId: ProviderSessionId.make("provider-session:opencode2-adapter"),
       modelSelection: {
@@ -313,11 +314,14 @@ export const openCode2ReplayRuntime = (
         model: "opencode/big-pickle",
       },
       runtimePolicy: {
-        runtimeMode: "full-access",
-        interactionMode: "default",
+        runtimeMode: "full-access" as const,
+        interactionMode: "default" as const,
         cwd: "/work/opencode2",
       },
-    });
+    };
+    return yield* options?.nativeThreadId === undefined
+      ? adapter.openSession(input)
+      : adapter.attachSession!({ ...input, nativeThreadId: options.nativeThreadId });
   }).pipe(
     Effect.provide(
       Layer.mergeAll(

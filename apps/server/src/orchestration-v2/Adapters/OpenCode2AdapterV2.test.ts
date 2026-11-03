@@ -695,6 +695,85 @@ it.layer(McpProviderSessions.layer)("OpenCode2 adapter", (it) => {
     }).pipe(Effect.scoped),
   );
 
+  it.effect("attaches without cancelling approvals or replacing the source settings", () =>
+    Effect.gen(function* () {
+      const runtime = yield* openCode2ReplayRuntime(
+        [
+          out("session.get", { sessionID: SESSION }),
+          replyData("session.get", sessionInfo()),
+          ...opening,
+          out("session.get", { sessionID: SESSION }),
+          replyData("session.get", sessionInfo()),
+        ],
+        { external: true, nativeThreadId: SESSION },
+      );
+      const thread = yield* runtime.resumeThread({
+        providerThread: providerThread(yield* DateTime.now),
+        threadId,
+        modelSelection: bigPickle,
+        runtimePolicy: { ...policy("approval-required"), cwd: "/another-directory" },
+      });
+      assert.strictEqual(thread.nativeThreadRef?.nativeId, SESSION);
+      assert.strictEqual(runtime.processOwnership, "external");
+      assert.strictEqual(runtime.requestsSurviveDisconnect, true);
+      assert.strictEqual(
+        runtime.providerSession.capabilities.sessions.supportsMultipleProviderThreadsPerSession,
+        false,
+      );
+      const error = yield* runtime
+        .resumeThread({
+          providerThread: {
+            ...thread,
+            nativeThreadRef: {
+              driver: OPENCODE_PROVIDER,
+              nativeId: "another-session",
+              strength: "strong",
+            },
+          },
+          threadId,
+        })
+        .pipe(Effect.flip);
+      assert.strictEqual(error._tag, "ProviderAdapterProtocolError");
+    }).pipe(Effect.scoped),
+  );
+
+  it.effect("leaves an attached session running when T3 disconnects", () =>
+    Effect.gen(function* () {
+      const scope = yield* Scope.make();
+      const runtime = yield* openCode2ReplayRuntime(
+        withInstructions([
+          out("session.get", { sessionID: SESSION }),
+          replyData("session.get", sessionInfo()),
+          ...opening,
+          out("session.get", { sessionID: SESSION }),
+          replyData("session.get", sessionInfo()),
+          out("session.prompt", { sessionID: SESSION, text: "<any>" }),
+          promptAccepted,
+        ]),
+        { external: true, nativeThreadId: SESSION },
+      ).pipe(Scope.provide(scope));
+      const thread = yield* runtime.ensureThread({
+        threadId,
+        modelSelection: bigPickle,
+        runtimePolicy: policy(),
+      });
+      assert.strictEqual(thread.nativeThreadRef?.nativeId, SESSION);
+      yield* runtime.startTurn(turnInput(thread));
+      assert.strictEqual(runtime.providerSession.status, "running");
+      // The recording deliberately contains no session.interrupt or request replies.
+      yield* Scope.close(scope, Exit.void);
+    }),
+  );
+
+  it.effect("does not attach through a managed server connection", () =>
+    Effect.gen(function* () {
+      const error = yield* openCode2ReplayRuntime([], { nativeThreadId: SESSION }).pipe(
+        Effect.flip,
+      );
+      assert.strictEqual(error._tag, "ProviderAdapterOpenSessionError");
+    }).pipe(Effect.scoped),
+  );
+
   it.effect("stops running turns on an external server when the session closes", () =>
     Effect.gen(function* () {
       const scope = yield* Scope.make();

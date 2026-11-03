@@ -8130,7 +8130,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
         ...input,
         attachedNativeThreadId: input.nativeThreadId,
       });
-      return { ...runtime, processOwnership: "external" as const };
+      return Object.assign(runtime, { processOwnership: "external" as const });
     }),
   });
 });

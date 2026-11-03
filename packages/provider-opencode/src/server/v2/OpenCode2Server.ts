@@ -25,6 +25,7 @@ export class OpenCode2Server extends Context.Service<
   {
     readonly withConnection: <A, E, R>(
       use: (connection: OpenCode2Connection) => Effect.Effect<A, E, R>,
+      options?: { readonly externalOnly: true },
     ) => Effect.Effect<A, E | OpenCodeRuntime.OpenCodeRuntimeError, R>;
   }
 >()("@t3tools/provider-opencode/server/v2/OpenCode2Server") {}
@@ -155,7 +156,15 @@ export const make = Effect.fn("OpenCode2Server.make")(function* (input: {
     verify: (url) => connectTo(url, password, false).pipe(Effect.flatMap(remember)),
   });
   return OpenCode2Server.of({
-    withConnection: Effect.fn("OpenCode2Server.withConnection")(function (use) {
+    withConnection: Effect.fn("OpenCode2Server.withConnection")(function (use, options) {
+      if (options?.externalOnly) {
+        return Effect.fail(
+          new OpenCodeRuntime.OpenCodeRuntimeError({
+            operation: "attach",
+            detail: "Attaching requires an existing OpenCode server URL.",
+          }),
+        );
+      }
       return owner.withServer((server) =>
         latest?.url === server.url
           ? use(latest)

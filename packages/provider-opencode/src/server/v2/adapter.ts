@@ -681,20 +681,28 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
   const mcpServerNameFor = (threadId: string) =>
     t3McpServerName(threadId).pipe(Effect.provideService(Crypto.Crypto, crypto));
 
-  const borrow = Effect.gen(function* () {
+  const borrow = Effect.fnUntraced(function* (externalOnly = false) {
     const lent = yield* Deferred.make<
       OpenCode2Server.OpenCode2Connection,
       OpenCodeRuntime.OpenCodeRuntimeError
     >();
     yield* server
-      .withConnection((connection) =>
-        Deferred.succeed(lent, connection).pipe(Effect.andThen(Effect.never)),
+      .withConnection(
+        (connection) => Deferred.succeed(lent, connection).pipe(Effect.andThen(Effect.never)),
+        externalOnly ? { externalOnly: true } : undefined,
       )
       .pipe(
         Effect.catch((error) => Deferred.fail(lent, error)),
         Effect.forkScoped,
       );
-    return yield* Deferred.await(lent);
+    const connection = yield* Deferred.await(lent);
+    if (externalOnly && !connection.external) {
+      return yield* new OpenCodeRuntime.OpenCodeRuntimeError({
+        operation: "attach",
+        detail: "Attaching requires an existing OpenCode server URL.",
+      });
+    }
+    return connection;
   });
 
   const openSession = Effect.fn("OpenCode2Adapter.openSession")(function* (
@@ -702,8 +710,10 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
     initial: {
       readonly connection: OpenCode2Server.OpenCode2Connection;
       readonly scope: Scope.Closeable;
+      readonly nativeThreadId?: string;
     },
   ) {
+    const externallyOwned = initial.nativeThreadId !== undefined;
     let connection = initial.connection;
     let client = connection.client;
     const sessionScope = yield* Effect.scope;
@@ -720,7 +730,15 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
       status: "ready",
       cwd: input.runtimePolicy.cwd ?? host.paths.cwd,
       model: input.modelSelection.model,
-      capabilities: OpenCode2ProviderCapabilities,
+      capabilities: externallyOwned
+        ? {
+            ...OpenCode2ProviderCapabilities,
+            sessions: {
+              ...OpenCode2ProviderCapabilities.sessions,
+              supportsMultipleProviderThreadsPerSession: false,
+            },
+          }
+        : OpenCode2ProviderCapabilities,
       createdAt: now,
       updatedAt: now,
       lastError: null,
@@ -2664,7 +2682,7 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
       // Release the borrow on every failure, including reconnect interruption, so spawned servers can idle-stop.
       const scope = yield* Scope.make();
       const { next, stream } = yield* Effect.gen(function* () {
-        const next = yield* borrow.pipe(Effect.provideService(Scope.Scope, scope));
+        const next = yield* borrow(externallyOwned).pipe(Effect.provideService(Scope.Scope, scope));
         return { next, stream: yield* next.events };
       }).pipe(Effect.onError(() => Scope.close(scope, Exit.void)));
       const previous = currentScope;
@@ -2716,8 +2734,8 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
     // Subscribed before any session or prompt call, so no event of theirs is missed.
     yield* follow(yield* connection.events).pipe(Effect.forkScoped);
 
-    // External servers outlive T3; stop their turns before losing observation.
-    if (connection.external) {
+    // Stop T3-owned turns before losing observation; attached source turns outlive this client.
+    if (connection.external && !externallyOwned) {
       yield* Effect.addFinalizer(() =>
         Effect.forEach(
           [...threads].filter(([, state]) => state.active !== undefined),
@@ -3380,6 +3398,9 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
       instanceId,
       driver,
       providerSessionId: input.providerSessionId,
+      ...(externallyOwned
+        ? { processOwnership: "external" as const, requestsSurviveDisconnect: true }
+        : {}),
       get providerSession() {
         return session;
       },
@@ -3404,6 +3425,32 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
               threadId: threadInput.threadId,
               modelSelection: threadInput.modelSelection,
               runtimePolicy: threadInput.runtimePolicy,
+            });
+          }
+          if (initial.nativeThreadId !== undefined) {
+            const createdAt = yield* DateTime.now;
+            return yield* runtime.resumeThread({
+              providerThread: {
+                id: idAllocator.derive.providerThread({
+                  driver,
+                  nativeThreadId: initial.nativeThreadId,
+                }),
+                driver,
+                providerInstanceId: instanceId,
+                providerSessionId: input.providerSessionId,
+                appThreadId: threadInput.threadId,
+                ownerNodeId: null,
+                firstRunOrdinal: null,
+                lastRunOrdinal: null,
+                handoffIds: [],
+                forkedFrom: null,
+                createdAt,
+                updatedAt: createdAt,
+                nativeThreadRef: ref(initial.nativeThreadId),
+                nativeConversationHeadRef: null,
+                status: "idle",
+              },
+              threadId: threadInput.threadId,
             });
           }
           yield* readModelsOnce(threadInput.runtimePolicy.cwd);
@@ -3479,7 +3526,13 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
       resumeThread: Effect.fn("OpenCode2Adapter.resumeThread")(
         function* (threadInput) {
           const sessionId = yield* sessionIdOf(threadInput.providerThread);
-          if (threadInput.runtimePolicy !== undefined) {
+          if (initial.nativeThreadId !== undefined && sessionId !== initial.nativeThreadId) {
+            return yield* new ProviderAdapter.ProviderAdapterProtocolError({
+              driver,
+              detail: "An attached runtime cannot adopt a different OpenCode session.",
+            });
+          }
+          if (!externallyOwned && threadInput.runtimePolicy !== undefined) {
             yield* readModelsOnce(threadInput.runtimePolicy.cwd);
           }
           const native = yield* client.session.get({ sessionID: Session.ID.make(sessionId) });
@@ -3491,7 +3544,13 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
           };
           const cwd = threadInput.runtimePolicy?.cwd;
           const loaded = threads.has(sessionId);
-          const state = register(providerThread, native, cwd ?? native.location.directory);
+          const state = register(
+            providerThread,
+            native,
+            externallyOwned ? native.location.directory : (cwd ?? native.location.directory),
+          );
+          // Attaching observes the source's settings and outstanding requests without changing them.
+          if (externallyOwned) return state.providerThread;
           if (!loaded) yield* stopLeftoverRequests(state);
           yield* writeRules(state, threadInput.runtimePolicy ?? state.policy);
           if (cwd != null && native.location.directory !== cwd) {
@@ -4086,13 +4145,45 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
     planSelectionTransition: Effect.fn("OpencodeAdapter.planSelectionTransition")(function () {
       return Effect.succeed(turnScopedSelectionTransition());
     }),
+    attachSession: Effect.fn("OpenCode2Adapter.attachSession")(
+      function* (input) {
+        if (!input.nativeThreadId.trim()) {
+          return yield* new ProviderAdapter.ProviderAdapterProtocolError({
+            driver,
+            detail: "An existing OpenCode session ID is required.",
+          });
+        }
+        const scope = yield* Scope.make();
+        yield* Effect.addFinalizer((exit) => Scope.close(scope, exit));
+        const connection = yield* borrow(true).pipe(Effect.provideService(Scope.Scope, scope));
+        // Validate existence without creating, moving or modifying the source session.
+        yield* connection.client.session.get({ sessionID: Session.ID.make(input.nativeThreadId) });
+        const runtime = yield* openSession(input, {
+          connection,
+          scope,
+          nativeThreadId: input.nativeThreadId,
+        });
+        return Object.assign(runtime, { processOwnership: "external" as const });
+      },
+      (effect, input) =>
+        effect.pipe(
+          Effect.mapError(
+            (cause) =>
+              new ProviderAdapter.ProviderAdapterOpenSessionError({
+                driver,
+                providerSessionId: input.providerSessionId,
+                cause,
+              }),
+          ),
+        ),
+    ),
     // The session borrows the instance's server for as long as it is open, so a
     // spawned server is not idle-stopped under a long tool call.
     openSession: Effect.fn("OpenCode2Adapter.borrowAndOpenSession")(
       function* (input) {
         const scope = yield* Scope.make();
         yield* Effect.addFinalizer((exit) => Scope.close(scope, exit));
-        const connection = yield* borrow.pipe(Effect.provideService(Scope.Scope, scope));
+        const connection = yield* borrow().pipe(Effect.provideService(Scope.Scope, scope));
         return yield* openSession(input, { connection, scope });
       },
       (effect, input) =>

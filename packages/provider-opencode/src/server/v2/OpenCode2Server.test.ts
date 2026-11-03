@@ -148,6 +148,40 @@ describe("OpenCode2Server error details", () => {
   );
 });
 
+describe("OpenCode2Server attachment", () => {
+  it.live("rejects native attachment before spawning a managed server", () =>
+    Effect.gen(function* () {
+      const server = yield* OpenCode2Server.make({
+        binaryPath: "/must-not-spawn-for-attachment",
+        serverUrl: "",
+        serverPassword: "",
+        directory: "/project",
+        environment: {},
+      });
+      let used = false;
+      const error = yield* server
+        .withConnection(
+          () =>
+            Effect.sync(() => {
+              used = true;
+            }),
+          { externalOnly: true },
+        )
+        .pipe(Effect.flip);
+      assert.strictEqual(error.operation, "attach");
+      assert.strictEqual(used, false);
+    }).pipe(
+      Effect.scoped,
+      Effect.provide(
+        Layer.mergeAll(
+          OpenCode2Client.layer,
+          OpenCodeRuntime.layer.pipe(Layer.provide(OpenCodeServerLedger.layerTest)),
+        ).pipe(Layer.provideMerge(Layer.mergeAll(NodeServices.layer, FetchHttpClient.layer))),
+      ),
+    ),
+  );
+});
+
 describe("OpenCode2Server passwords", () => {
   it("hands the spawned server only the T3 password", () => {
     const password = Redacted.make("t3-generated");
