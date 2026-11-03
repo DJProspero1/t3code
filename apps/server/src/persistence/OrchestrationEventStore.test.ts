@@ -294,6 +294,14 @@ layer("OrchestrationEventStore", (it) => {
         new Map(byIds.map((row) => [row.event.id, row.event])),
         new Map(events.map((event) => [event.id, event])),
       );
+      yield* sql`UPDATE orchestration_events SET application_event_version = 1
+        WHERE event_id = ${events[0]!.id}`;
+      assert.deepEqual(yield* store.readAgentEventsById([events[0]!.id]), []);
+      yield* sql`UPDATE orchestration_events SET application_event_version = 2,
+        aggregate_kind = 'project' WHERE event_id = ${events[0]!.id}`;
+      assert.deepEqual(yield* store.readAgentEventsById([events[0]!.id]), []);
+      yield* sql`UPDATE orchestration_events SET aggregate_kind = 'thread'
+        WHERE event_id = ${events[0]!.id}`;
       const replayed = yield* store.readAgentEvents({ threadId }).pipe(Stream.runCollect);
       assert.deepEqual(replayed, appended);
       const applicationEvents = yield* store

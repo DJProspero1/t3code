@@ -602,11 +602,13 @@ const makeEventStore = Effect.gen(function* () {
           application_event_version, causation_event_id, correlation_id
         FROM orchestration_events
         WHERE event_id IN ${sql.in(unique.slice(offset, offset + READ_PAGE_SIZE))}
-          AND application_event_version = 2 AND aggregate_kind = 'thread'
       `.pipe(
         Effect.mapError(toPersistenceSqlError("OrchestrationEventStore.readAgentEventsById:query")),
       );
       for (const row of rows) {
+        // Keep this lookup on the unique event-ID index. SQLite otherwise prefers
+        // the application-version index for larger IN lists and scans all history.
+        if (row.application_event_version !== 2 || row.aggregate_kind !== "thread") continue;
         events.push(
           yield* rowToV2StoredEvent(row).pipe(
             Effect.mapError(
